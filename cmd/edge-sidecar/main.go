@@ -81,7 +81,15 @@ func run(ctx context.Context, s api.Settings, stage string) error {
 
 func main() {
 	envFile := flag.String("env", "", "Path to .env file, 'stdin' or empty")
+	versionFlag := flag.Bool("version", false, "Print version and exit")
+
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Print(GitCommit)
+		return
+	}
+
 	if err := start(*envFile); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
