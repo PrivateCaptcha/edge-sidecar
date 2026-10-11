@@ -1,0 +1,265 @@
+package difficulty
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"math"
+	"runtime/debug"
+	"time"
+
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/leakybucket"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/puzzle"
+)
+
+var (
+	errBackfillPanic = errors.New("panic during backfill")
+)
+
+const (
+	userBucketsCacheFilename      = "user_buckets.gob"
+	defaultBackpressureTimeout    = 10 * time.Millisecond
+	propertyBackfillIntervalCount = 12
+)
+
+type Levels struct {
+	timeSeries          common.TimeSeriesStore
+	algorithm           Algorithm
+	propertyBuckets     *leakybucket.Manager[int32, leakybucket.VarLeakyBucket[int32], *leakybucket.VarLeakyBucket[int32]]
+	userBuckets         *leakybucket.Manager[common.TFingerprint, leakybucket.ConstLeakyBucket[common.TFingerprint], *leakybucket.ConstLeakyBucket[common.TFingerprint]]
+	accessChan          chan *common.AccessRecord
+	backfillChan        chan *common.BackfillRequest
+	batchSize           int
+	accessLogCancel     context.CancelFunc
+	backpressureTimeout time.Duration
+}
+
+func NewLevels(timeSeries common.TimeSeriesStore, batchSize int, bucketSize time.Duration) *Levels {
+	algorithm := NewDifficultyAlgorithm(bucketSize)
+	return NewLevelsEx(timeSeries, algorithm, batchSize, bucketSize)
+}
+
+func NewLevelsEx(timeSeries common.TimeSeriesStore, algorithm Algorithm, batchSize int, bucketSize time.Duration) *Levels {
+	const (
+		propertyBucketCap = math.MaxUint32
+		// below numbers are rather arbitrary as we can support "many"
+		// as for users, we want to keep only the "most active" ones as "not active enough" activity
+		// does not affect difficulty much, if at all
+		maxUserBuckets     = 1_000_000
+		maxPropertyBuckets = 100_000
+		userBucketCap      = math.MaxUint32
+		// user worst case: everybody in the private network (VPN, BigCorp internal) access single resource (survey, login)
+		// estimate: 12 "free" requests per minute should be "enough for everybody" (tm), after that difficulty grows
+		userLeakRatePerMinute = 12
+		userBucketSize        = time.Minute / userLeakRatePerMinute
+	)
+
+	levels := &Levels{
+		timeSeries:          timeSeries,
+		algorithm:           algorithm,
+		propertyBuckets:     leakybucket.NewManager[int32, leakybucket.VarLeakyBucket[int32]](maxPropertyBuckets, propertyBucketCap, bucketSize),
+		userBuckets:         leakybucket.NewManager[common.TFingerprint, leakybucket.ConstLeakyBucket[common.TFingerprint]](maxUserBuckets, userBucketCap, userBucketSize),
+		accessChan:          make(chan *common.AccessRecord, 10*batchSize),
+		backfillChan:        make(chan *common.BackfillRequest, batchSize),
+		batchSize:           batchSize,
+		accessLogCancel:     func() {},
+		backpressureTimeout: defaultBackpressureTimeout,
+	}
+
+	return levels
+}
+
+func (levels *Levels) BackfillTimeout() time.Duration {
+	return levels.backpressureTimeout
+}
+
+func (levels *Levels) Init(accessLogInterval, backfillInterval, backpressureTimeout time.Duration) {
+	levels.backpressureTimeout = max(backpressureTimeout, defaultBackpressureTimeout)
+
+	const (
+		maxPendingBatchSize = 100_000
+		levelsService       = "levels"
+	)
+	var accessCtx context.Context
+	accessBaseCtx := context.WithValue(context.Background(), common.ServiceContextKey, levelsService)
+	accessCtx, levels.accessLogCancel = context.WithCancel(
+		context.WithValue(accessBaseCtx, common.TraceIDContextKey, "access_log"))
+	go common.ProcessBatchArray(accessCtx, levels.accessChan, accessLogInterval, levels.batchSize, maxPendingBatchSize, levels.timeSeries.WriteAccessLogBatch)
+
+	difficultyBaseCtx := context.WithValue(context.Background(), common.ServiceContextKey, levelsService)
+	go levels.backfillDifficulty(context.WithValue(difficultyBaseCtx, common.TraceIDContextKey, "backfill_difficulty"),
+		backfillInterval)
+}
+
+func (l *Levels) Stop() {
+	slog.Debug("Shutting down levels routines")
+	l.accessLogCancel()
+}
+
+func (l *Levels) Shutdown() {
+	close(l.accessChan)
+	close(l.backfillChan)
+}
+
+func (l *Levels) DifficultyEx(ctx context.Context, fingerprint common.TFingerprint, p Property, tnow time.Time, verificationRate float64) (uint8, leakybucket.TLevel, error) {
+	return l.difficultyEx(ctx, fingerprint, p, tnow, verificationRate)
+}
+
+func (l *Levels) difficultyEx(ctx context.Context, fingerprint common.TFingerprint, p Property, tnow time.Time, verificationRate float64) (uint8, leakybucket.TLevel, error) {
+	propertyAddResult := l.propertyBuckets.Add(p.ID(), 1, tnow)
+	var backfillErr error
+	if !propertyAddResult.Found {
+		backfillErr = l.backfillProperty(ctx, p)
+	}
+
+	userAddResult := l.userBuckets.Add(fingerprint, 1, tnow)
+
+	difficulty := l.algorithm.Difficulty(&propertyAddResult, &userAddResult, p, verificationRate)
+
+	return difficulty, propertyAddResult.CurrLevel, backfillErr
+}
+
+func (l *Levels) Difficulty(ctx context.Context, fingerprint common.TFingerprint, p Property, tnow time.Time, verificationRate float64) uint8 {
+	diff, _, _ := l.DifficultyEx(ctx, fingerprint, p, tnow, verificationRate)
+	return diff
+}
+
+func (l *Levels) backfillProperty(ctx context.Context, p Property) error {
+	br := &common.BackfillRequest{
+		OrgID:      p.OrgID(),
+		UserID:     p.OwnerID(),
+		PropertyID: p.ID(),
+	}
+
+	select {
+	case l.backfillChan <- br:
+		return nil
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
+		return common.ErrBackpressure
+	case <-time.After(l.backpressureTimeout):
+		return common.ErrBackpressure
+	}
+}
+
+func (l *Levels) BackfillAccess(ctx context.Context, result *puzzle.VerifyResult) error {
+	ar := &common.AccessRecord{
+		Fingerprint: 0, // we lose information about user but having totals still helps for difficulty calculation
+		UserID:      result.UserID,
+		OrgID:       result.OrgID,
+		PropertyID:  result.PropertyID,
+		RuleID:      0,
+		Timestamp:   result.CreatedAt,
+		ExpiresAt:   result.ExpiresAt,
+	}
+
+	return l.RecordAccess(ctx, ar)
+}
+
+func (l *Levels) RecordAccess(ctx context.Context, ar *common.AccessRecord) error {
+	if ar == nil {
+		return nil
+	}
+
+	timer := time.NewTimer(l.backpressureTimeout)
+	defer timer.Stop()
+
+	select {
+	case l.accessChan <- ar:
+		return nil
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// genuine client disconnect
+			return ctx.Err()
+		}
+		// DeadlineExceeded on puzzle/verify path degrades to drop-and-serve
+		return common.ErrBackpressure
+	case <-timer.C:
+		return common.ErrBackpressure
+	}
+}
+
+func (l *Levels) Reset() {
+	l.propertyBuckets.Clear()
+	l.userBuckets.Clear()
+}
+
+func (l *Levels) retrievePropertyStatsSafe(ctx context.Context, r *common.BackfillRequest) (data []*common.TimeCount, err error) {
+	defer func() {
+		if rvr := recover(); rvr != nil {
+			slog.ErrorContext(ctx, "Recovered from ClickHouse query panic", "panic", rvr, "stack", string(debug.Stack()))
+			data = []*common.TimeCount{}
+			err = errBackfillPanic
+		}
+	}()
+
+	// We keep the last hour of 5-minute intervals in ClickHouse.
+	timeFrom := time.Now().UTC().Add(-time.Duration(propertyBackfillIntervalCount) * l.propertyBuckets.LeakInterval())
+	return l.timeSeries.RetrievePropertyStatsSince(ctx, r, timeFrom)
+}
+
+func (l *Levels) backfillDifficulty(ctx context.Context, cacheDuration time.Duration) {
+	slog.DebugContext(ctx, "Backfilling difficulty", "cacheDuration", cacheDuration)
+
+	const maxCacheSize = 250
+	cache := make(map[string]time.Time, maxCacheSize/3)
+	lastCleanupTime := time.Now()
+
+	for r := range l.backfillChan {
+		blog := slog.With("pid", r.PropertyID)
+		cacheKey := r.Key()
+		tnow := time.Now()
+		if t, ok := cache[cacheKey]; ok && tnow.Sub(t) <= cacheDuration {
+			blog.WarnContext(ctx, "Skipping duplicate backfill request", "time", t)
+			continue
+		}
+
+		counts, err := l.retrievePropertyStatsSafe(ctx, r)
+		if err != nil {
+			blog.ErrorContext(ctx, "Failed to backfill stats", common.ErrAttr(err))
+			continue
+		}
+
+		cache[cacheKey] = tnow
+
+		if len(counts) > 0 {
+			if len(counts) > propertyBackfillIntervalCount {
+				// Property stats are ordered oldest-first, so discard surplus oldest intervals.
+				counts = counts[len(counts)-propertyBackfillIntervalCount:]
+			}
+			var total uint64
+			for _, count := range counts {
+				total += uint64(count.Count)
+			}
+			level := leakybucket.TLevel(min(total, uint64(math.MaxUint32)))
+			leakRate := float64(total) / float64(propertyBackfillIntervalCount)
+			addResult := leakybucket.SeedVarBucket(l.propertyBuckets, r.PropertyID, level, leakRate, propertyBackfillIntervalCount, time.Now())
+			blog.InfoContext(ctx, "Backfilled requests counts", "counts", len(counts), "level", addResult.CurrLevel)
+		}
+
+		if (len(cache) > maxCacheSize) || (time.Since(lastCleanupTime) >= cacheDuration) {
+			slog.DebugContext(ctx, "Cleaning up backfill cache", "size", len(cache))
+			for key, value := range cache {
+				if tnow.Sub(value) > cacheDuration {
+					delete(cache, key)
+				}
+			}
+
+			lastCleanupTime = time.Now()
+		}
+	}
+
+	slog.DebugContext(ctx, "Finished backfilling difficulty")
+}
+
+func (l *Levels) SaveCache(ctx context.Context, dir string) error {
+	const cachePersistSize = 1_000
+	return l.userBuckets.SaveCache(ctx, dir, userBucketsCacheFilename, cachePersistSize, time.Now())
+}
+
+func (l *Levels) LoadCache(ctx context.Context, dir string) error {
+	return l.userBuckets.LoadCache(ctx, dir, userBucketsCacheFilename, l.propertyBuckets.LeakInterval()*propertyBackfillIntervalCount)
+}

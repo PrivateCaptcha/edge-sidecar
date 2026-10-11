@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches:
+    - '**'
+    paths-ignore:
+    - 'docs/**'
+    - '**.md'
+    - 'docker-compose.yml'
+    - 'Dockerfile'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      with:
+        go-version-file: go.mod
+        cache: false
+
+    - name: Build
+      run: make build
+
+    - name: Test
+      run: make test-unit
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      PC_SITEKEY: ${{ secrets.PC_SITEKEY }}
+      PC_API_KEY: ${{ secrets.PC_API_KEY }}
+      PC_EDGE_HOST: ${{ vars.PC_EDGE_HOST || 'edge.privatecaptcha.test' }}
+      PC_EDGE_PORT: '8443'
+      EDGE_DOCKER_ENV: /dev/null
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      with:
+        persist-credentials: false
+
+    - name: Check E2E configuration
+      run: |
+        : "${PC_SITEKEY:?Set the PC_SITEKEY repository secret}"
+        : "${PC_API_KEY:?Set the PC_API_KEY repository secret}"
+
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      with:
+        node-version: '22'
+        package-manager-cache: false
+
+    - name: Install Playwright
+      run: make setup-e2e PLAYWRIGHT_INSTALL_FLAGS=--with-deps
+
+    - name: Resolve the test hostname
+      run: printf '127.0.0.1 %s\n' "$PC_EDGE_HOST" | sudo tee -a /etc/hosts
+
+    - name: Start the demo stack
+      run: make run-edge-docker EDGE_DOCKER_FLAGS="--wait --wait-timeout 120"
+
+    - name: Wait for the sidecar
+      run: |
+        for attempt in {1..60}; do
+          if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://${PC_EDGE_HOST}:${PC_EDGE_PORT}/private") && [ "$status" = '401' ]; then
+            exit 0
+          fi
+          sleep 1
+        done
+        printf 'Sidecar was not ready after %s attempts (HTTP %s)\n' "$attempt" "$status" >&2
+        exit 1
+
+    - name: Run E2E tests
+      run: make test-e2e
+
+    - name: Show container logs on failure
+      if: failure()
+      run: make logs-edge-docker EDGE_DOCKER_LOG_FLAGS=--no-color
+
+    - name: Upload Playwright failure artifacts
+      if: failure()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: playwright-report
+        path: |
+          playwright-report/
+          test-results/
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Stop the demo stack
+      if: always()
+      run: make stop-edge-docker

@@ -1,0 +1,874 @@
+package db
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/netip"
+	"time"
+
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+	dbgen "github.com/PrivateCaptcha/PrivateCaptcha/pkg/db/generated"
+)
+
+type AuditLog struct {
+	querier       dbgen.Querier
+	persistChan   chan *common.AuditLogEvent
+	persistCancel context.CancelFunc
+	batchSize     int
+}
+
+var _ common.AuditLog = (*AuditLog)(nil)
+
+func NewAuditLog(querier dbgen.Querier, batchSize int) *AuditLog {
+	return &AuditLog{
+		querier:       querier,
+		persistChan:   make(chan *common.AuditLogEvent, batchSize),
+		persistCancel: func() {},
+		batchSize:     batchSize,
+	}
+}
+
+func (al *AuditLog) Start(ctx context.Context, interval time.Duration) {
+	var cancelCtx context.Context
+	cancelCtx, al.persistCancel = context.WithCancel(
+		context.WithValue(ctx, common.TraceIDContextKey, "persist_auditlog"))
+	go common.ProcessBatchArray(cancelCtx, al.persistChan, interval, al.batchSize, al.batchSize*10, al.PersistAuditLog)
+}
+
+func (al *AuditLog) Stop() {
+	al.persistCancel()
+}
+
+func (al *AuditLog) Shutdown() {
+	slog.Debug("Shutting down audit log persistence")
+	close(al.persistChan)
+}
+
+func (al *AuditLog) PersistAuditLog(ctx context.Context, batch []*common.AuditLogEvent) error {
+	dbBatch := make([]*dbgen.CreateAuditLogsParams, 0, len(batch))
+
+	for _, e := range batch {
+		action := dbgen.AuditLogActionUnknown
+		switch e.Action {
+		case common.AuditLogActionCreate:
+			action = dbgen.AuditLogActionCreate
+		case common.AuditLogActionUpdate:
+			action = dbgen.AuditLogActionUpdate
+		case common.AuditLogActionDelete:
+			action = dbgen.AuditLogActionDelete
+		case common.AuditLogActionSoftDelete:
+			action = dbgen.AuditLogActionSoftDelete
+		case common.AuditLogActionRecover:
+			action = dbgen.AuditLogActionRecover
+		case common.AuditLogActionLogin:
+			action = dbgen.AuditLogActionLogin
+		case common.AuditLogActionLogout:
+			action = dbgen.AuditLogActionLogout
+		case common.AuditLogActionAccess:
+			action = dbgen.AuditLogActionAccess
+		}
+
+		source := dbgen.AuditLogSourceUnknown
+		switch e.Source {
+		case common.AuditLogSourcePortal:
+			source = dbgen.AuditLogSourcePortal
+		case common.AuditLogSourceAPI:
+			source = dbgen.AuditLogSourceApi
+		}
+
+		var ipAddress *netip.Addr
+		if e.IPAddress.IsValid() {
+			ipAddress = &e.IPAddress
+		}
+
+		event := &dbgen.CreateAuditLogsParams{
+			UserID:      Int(e.UserID),
+			Action:      action,
+			Source:      source,
+			EntityID:    Int8(e.EntityID),
+			EntityTable: e.TableName,
+			SessionID:   e.SessionHash.String(),
+			OldValue:    nil,
+			NewValue:    nil,
+			CreatedAt:   Timestampz(e.Timestamp),
+			IpAddress:   ipAddress,
+		}
+
+		if e.OldValue != nil {
+			if payload, err := json.Marshal(e.OldValue); err == nil {
+				event.OldValue = payload
+			} else {
+				slog.ErrorContext(ctx, "Failed to serialize old value for audit log", "table", e.TableName, "entityID", e.EntityID, common.ErrAttr(err))
+			}
+		}
+
+		if e.NewValue != nil {
+			if payload, err := json.Marshal(e.NewValue); err == nil {
+				event.NewValue = payload
+			} else {
+				slog.ErrorContext(ctx, "Failed to serialize new value for audit log", "table", e.TableName, "entityID", e.EntityID, common.ErrAttr(err))
+			}
+		}
+
+		dbBatch = append(dbBatch, event)
+	}
+
+	return al.storeAuditLogEvents(ctx, dbBatch)
+}
+
+func (al *AuditLog) storeAuditLogEvents(ctx context.Context, batch []*dbgen.CreateAuditLogsParams) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	count, err := al.querier.CreateAuditLogs(ctx, batch)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to store audit log events", "count", len(batch), common.ErrAttr(err))
+		return err
+	}
+
+	slog.InfoContext(ctx, "Stored audit log events", "count", len(batch), "rows", count)
+
+	return nil
+}
+
+func (al *AuditLog) RecordEvents(ctx context.Context, events []*common.AuditLogEvent, source common.AuditLogSource) {
+	for _, event := range events {
+		al.RecordEvent(ctx, event, source)
+	}
+}
+
+func (al *AuditLog) RecordEvent(ctx context.Context, event *common.AuditLogEvent, source common.AuditLogSource) {
+	if event == nil {
+		slog.ErrorContext(ctx, "Discarding nil audit log event")
+		return
+	}
+
+	if (event.OldValue == nil) && (event.NewValue == nil) &&
+		(event.Action != common.AuditLogActionAccess) &&
+		(event.Action != common.AuditLogActionLogin) &&
+		(event.Action != common.AuditLogActionLogout) {
+		slog.WarnContext(ctx, "Audit log event has no payload", "table", event.TableName, "entityID", event.EntityID, "action", event.Action.String())
+	}
+
+	if event.UserID == 0 {
+		slog.ErrorContext(ctx, "Recording audit event without user ID", "table", event.TableName, "entityID", event.EntityID, "action", event.Action.String())
+	}
+
+	if hash, ok := ctx.Value(common.SessionHashContextKey).(common.SessionHash); ok && !hash.IsZero() {
+		event.SessionHash = hash
+	}
+
+	if ip, ok := ctx.Value(common.RateLimitKeyContextKey).(netip.Addr); ok && ip.IsValid() {
+		event.IPAddress = common.MaskIPAddress(ip)
+	} else {
+		slog.ErrorContext(ctx, "IP address not found in request context for audit log event", "table", event.TableName, "entityID", event.EntityID, "action", event.Action.String())
+	}
+
+	event.Timestamp = time.Now().UTC()
+	event.Source = source
+
+	slog.DebugContext(ctx, "Queueing audit log event", "action", event.Action.String(), "table", event.TableName, "userID", event.UserID, "source", source.String())
+	select {
+	case al.persistChan <- event:
+		// sent
+	case <-ctx.Done():
+		slog.WarnContext(ctx, "Context cancelled, discarding audit event", "table", event.TableName, "entityID", event.EntityID, common.ErrAttr(ctx.Err()))
+	}
+}
+
+type DiscardAuditLog struct{}
+
+var _ common.AuditLog = (*DiscardAuditLog)(nil)
+
+func (dal *DiscardAuditLog) RecordEvents(ctx context.Context, events []*common.AuditLogEvent, source common.AuditLogSource) {
+	for _, event := range events {
+		dal.RecordEvent(ctx, event, source)
+	}
+}
+
+func (dal *DiscardAuditLog) RecordEvent(ctx context.Context, event *common.AuditLogEvent, source common.AuditLogSource) {
+	if event == nil {
+		return
+	}
+
+	slog.WarnContext(ctx, "Discarded audit log event", "table", event.TableName, "entityID", event.EntityID, "action", event.Action)
+}
+
+func ParseAuditLogPayloads[T any](ctx context.Context, log *dbgen.AuditLog) (*T, *T, error) {
+	var tOld *T
+	if len(log.OldValue) > 0 {
+		tOld = new(T)
+		if err := json.Unmarshal(log.OldValue, tOld); err != nil {
+			slog.ErrorContext(ctx, "Failed to parse audit log old value", "table", log.EntityTable, "action", log.Action,
+				"length", len(log.OldValue), common.ErrAttr(err))
+			return nil, nil, err
+		}
+	}
+
+	var tNew *T
+	if len(log.NewValue) > 0 {
+		tNew = new(T)
+		if err := json.Unmarshal(log.NewValue, tNew); err != nil {
+			slog.ErrorContext(ctx, "Failed to parse audit log new value", "table", log.EntityTable, "action", log.Action,
+				"length", len(log.NewValue), common.ErrAttr(err))
+			return nil, nil, err
+		}
+	}
+
+	return tOld, tNew, nil
+}
+
+type AuditLogUser struct {
+	Name           string `json:"name,omitempty"`
+	Email          string `json:"email,omitempty"`
+	SubscriptionID int32  `json:"subscription_id,omitempty"`
+}
+
+func newAuditLogUser(user *dbgen.User) *AuditLogUser {
+	return &AuditLogUser{
+		Name:           user.Name,
+		Email:          user.Email,
+		SubscriptionID: user.SubscriptionID.Int32,
+	}
+}
+
+type AuditLogSubscription struct {
+	Source                 string          `json:"source,omitempty"`
+	Status                 string          `json:"status,omitempty"`
+	ExternalProductID      string          `json:"external_product_id,omitempty"`
+	ExternalSubscriptionID string          `json:"external_subscription_id,omitempty"`
+	ExternalPriceID        string          `json:"external_price_id,omitempty"`
+	CancelAt               common.JSONTime `json:"cancel_at,omitempty"`
+}
+
+func newAuditLogSubscription(subscription *dbgen.Subscription) *AuditLogSubscription {
+	log := &AuditLogSubscription{
+		Source:                 string(subscription.Source),
+		Status:                 subscription.Status,
+		ExternalProductID:      subscription.ExternalProductID,
+		ExternalSubscriptionID: subscription.ExternalSubscriptionID.String,
+		ExternalPriceID:        subscription.ExternalPriceID,
+		CancelAt:               common.JSONTime{},
+	}
+
+	if subscription.CancelFrom.Valid {
+		log.CancelAt = common.JSONTime(subscription.CancelFrom.Time)
+	}
+
+	return log
+}
+
+func newUserAuditLogEvent(user *dbgen.User, subscription *dbgen.Subscription, action common.AuditLogAction) *common.AuditLogEvent {
+	event := &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    action,
+		EntityID:  int64(user.ID),
+		TableName: TableNameUsers,
+		OldValue:  nil,
+		NewValue:  nil,
+	}
+
+	switch action {
+	case common.AuditLogActionCreate, common.AuditLogActionRecover:
+		event.NewValue = newAuditLogUser(user)
+	case common.AuditLogActionDelete, common.AuditLogActionSoftDelete:
+		event.OldValue = newAuditLogUser(user)
+	}
+
+	return event
+}
+
+func newUpdateUserSubscriptionEvent(user *dbgen.User, oldSubscription, newSubscription *dbgen.Subscription) *common.AuditLogEvent {
+	event := &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(newSubscription.ID),
+		TableName: TableNameSubscriptions,
+		NewValue:  newAuditLogSubscription(newSubscription),
+	}
+
+	if oldSubscription != nil {
+		event.OldValue = newAuditLogSubscription(oldSubscription)
+	}
+
+	return event
+}
+
+func newUpdateUserAuditLogEvent(oldUser *dbgen.User, newUser *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    oldUser.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(oldUser.ID),
+		TableName: TableNameUsers,
+		OldValue:  newAuditLogUser(oldUser),
+		NewValue:  newAuditLogUser(newUser),
+	}
+}
+
+type AuditLogOrg struct {
+	ID            int32  `json:"id"`
+	Name          string `json:"name"`
+	NewOwnerID    int32  `json:"new_owner_id,omitempty"`
+	NewOwnerEmail string `json:"new_owner_email,omitempty"`
+}
+
+func NewAuditLogOrg(org *dbgen.Organization) *AuditLogOrg {
+	return &AuditLogOrg{
+		ID:   org.ID,
+		Name: org.Name,
+	}
+}
+
+func newOrgAuditLogEvent(userID int32, org *dbgen.Organization, action common.AuditLogAction) *common.AuditLogEvent {
+	event := &common.AuditLogEvent{
+		UserID:    userID,
+		Action:    action,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgs,
+		OldValue:  nil,
+		NewValue:  nil,
+	}
+
+	switch action {
+	case common.AuditLogActionCreate, common.AuditLogActionRecover:
+		event.NewValue = NewAuditLogOrg(org)
+	case common.AuditLogActionDelete, common.AuditLogActionSoftDelete:
+		event.OldValue = NewAuditLogOrg(org)
+	}
+
+	return event
+}
+
+type AuditLogProperty struct {
+	Name                 string `json:"name,omitempty"`
+	Challenge            string `json:"challenge,omitempty"`
+	OrgID                int32  `json:"org_id,omitempty"`
+	OrgName              string `json:"org_name,omitempty"`
+	OrgOwnerID           int32  `json:"org_owner_id,omitempty"`
+	CreatorID            int32  `json:"creator_id,omitempty"`
+	Domain               string `json:"domain,omitempty"`
+	Level                int16  `json:"level,omitempty"`
+	Growth               string `json:"growth,omitempty"`
+	ValidityIntervalSec  int    `json:"validity_interval_s,omitempty"`
+	EdgeTokenValiditySec int    `json:"edge_token_validity_s,omitempty"`
+	MaxReplayCount       int32  `json:"max_replay_count,omitempty"`
+	AllowSubdomains      bool   `json:"allow_subdomains,omitempty"`
+	AllowLocalhost       bool   `json:"allow_localhost,omitempty"`
+}
+
+type AuditLogEdgeSettings struct {
+	Name                string `json:"name,omitempty"`
+	OrgID               int32  `json:"org_id,omitempty"`
+	CreatorID           int32  `json:"creator_id,omitempty"`
+	EdgeWidgetStartMode string `json:"edge_widget_start_mode,omitempty"`
+}
+
+func newAuditLogEdgeSettings(property *dbgen.Property, mode dbgen.EdgeWidgetStartMode) *AuditLogEdgeSettings {
+	return &AuditLogEdgeSettings{
+		Name:                property.Name,
+		OrgID:               property.OrgID.Int32,
+		CreatorID:           property.CreatorID.Int32,
+		EdgeWidgetStartMode: string(mode),
+	}
+}
+
+func newUpdateEdgeSettingsAuditLogEvent(property *dbgen.Property, oldMode, newMode dbgen.EdgeWidgetStartMode, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(property.ID),
+		TableName: TableNameEdgeSettings,
+		OldValue:  newAuditLogEdgeSettings(property, oldMode),
+		NewValue:  newAuditLogEdgeSettings(property, newMode),
+	}
+}
+
+type AuditLogForm struct {
+	Name              string `json:"name,omitempty"`
+	URL               string `json:"url,omitempty"`
+	OrgID             int32  `json:"org_id,omitempty"`
+	OrgOwnerID        int32  `json:"org_owner_id,omitempty"`
+	OrgName           string `json:"org_name,omitempty"`
+	PropertyID        int32  `json:"property_id,omitempty"`
+	RequestsPerMinute int16  `json:"requests_per_minute,omitempty"`
+	RetryRequestCount int16  `json:"retry_request_count,omitempty"`
+	RedirectCount     int16  `json:"redirect_count,omitempty"`
+	Method            string `json:"method,omitempty"`
+	Enabled           bool   `json:"enabled"`
+	Active            bool   `json:"active"`
+}
+
+func newAuditLogForm(form *dbgen.Form, org *dbgen.Organization) *AuditLogForm {
+	if form == nil {
+		return nil
+	}
+
+	event := &AuditLogForm{
+		Name:              form.Name,
+		URL:               form.URL,
+		OrgID:             form.OrgID.Int32,
+		OrgOwnerID:        form.OrgOwnerID.Int32,
+		PropertyID:        form.PropertyID,
+		Enabled:           form.Enabled,
+		Active:            form.Active,
+		RequestsPerMinute: form.RequestsPerMinute,
+		RetryRequestCount: form.RetryRequestCount,
+		RedirectCount:     form.RedirectCount,
+		Method:            string(form.Method),
+	}
+
+	if org != nil {
+		event.OrgName = org.Name
+	}
+
+	return event
+}
+
+func newAuditLogOldForm(form *dbgen.Form, updateRow *dbgen.UpdateFormRow, org *dbgen.Organization) *AuditLogForm {
+	if updateRow == nil {
+		return nil
+	}
+
+	event := &AuditLogForm{
+		Name:              updateRow.OldName,
+		URL:               updateRow.OldURL,
+		OrgID:             form.OrgID.Int32,
+		OrgOwnerID:        form.OrgOwnerID.Int32,
+		PropertyID:        form.PropertyID,
+		Enabled:           form.Enabled,
+		RedirectCount:     updateRow.OldRedirectCount,
+		Active:            updateRow.OldActive,
+		RequestsPerMinute: updateRow.OldRequestsPerMinute,
+		RetryRequestCount: updateRow.OldRetryRequestCount,
+		Method:            string(updateRow.OldMethod),
+	}
+
+	if org != nil {
+		event.OrgName = org.Name
+	}
+
+	return event
+}
+
+func newAuditLogProperty(property *dbgen.Property, org *dbgen.Organization) *AuditLogProperty {
+	if property == nil {
+		return nil
+	}
+
+	event := &AuditLogProperty{
+		Name:                 property.Name,
+		Challenge:            string(property.Challenge),
+		OrgID:                property.OrgID.Int32,
+		OrgOwnerID:           property.OrgOwnerID.Int32,
+		CreatorID:            property.CreatorID.Int32,
+		Domain:               property.Domain,
+		Level:                property.Level.Int16,
+		Growth:               string(property.Growth),
+		ValidityIntervalSec:  int(property.ValidityInterval.Seconds()),
+		EdgeTokenValiditySec: int(property.EdgeTokenValidityInterval.Seconds()),
+		MaxReplayCount:       property.MaxReplayCount,
+		AllowSubdomains:      property.AllowSubdomains,
+		AllowLocalhost:       property.AllowLocalhost,
+	}
+
+	if org != nil {
+		event.OrgName = org.Name
+	}
+
+	return event
+}
+
+func newAuditLogOldProperty(property *dbgen.Property, updateRow *dbgen.UpdatePropertyRow, org *dbgen.Organization) *AuditLogProperty {
+	if updateRow == nil {
+		return nil
+	}
+
+	event := &AuditLogProperty{
+		Name:                 updateRow.OldName,
+		Challenge:            string(updateRow.OldChallenge),
+		OrgID:                property.OrgID.Int32,
+		OrgOwnerID:           property.OrgOwnerID.Int32,
+		CreatorID:            property.CreatorID.Int32,
+		Domain:               property.Domain,
+		Level:                updateRow.OldLevel.Int16,
+		Growth:               string(updateRow.OldGrowth),
+		ValidityIntervalSec:  int(updateRow.OldValidityInterval.Seconds()),
+		EdgeTokenValiditySec: int(updateRow.OldEdgeTokenValidityInterval.Seconds()),
+		MaxReplayCount:       updateRow.OldMaxReplayCount,
+		AllowSubdomains:      updateRow.OldAllowSubdomains,
+		AllowLocalhost:       updateRow.OldAllowLocalhost,
+	}
+
+	if org != nil {
+		event.OrgName = org.Name
+	}
+
+	return event
+}
+
+func newCreatePropertyAuditLogEvent(property *dbgen.Property, org *dbgen.Organization) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    property.CreatorID.Int32,
+		Action:    common.AuditLogActionCreate,
+		EntityID:  int64(property.ID),
+		TableName: TableNameProperties,
+		OldValue:  nil,
+		NewValue:  newAuditLogProperty(property, org),
+	}
+}
+
+func newCreateFormAuditLogEvent(form *dbgen.Form, org *dbgen.Organization) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    form.CreatorID.Int32,
+		Action:    common.AuditLogActionCreate,
+		EntityID:  int64(form.ID),
+		TableName: TableNameForms,
+		OldValue:  nil,
+		NewValue:  newAuditLogForm(form, org),
+	}
+}
+
+func newUpdatePropertyAuditLogEvent(updatedProperty *dbgen.Property, updateRow *dbgen.UpdatePropertyRow, org *dbgen.Organization, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(updatedProperty.ID),
+		TableName: TableNameProperties,
+		OldValue:  newAuditLogOldProperty(updatedProperty, updateRow, org),
+		NewValue:  newAuditLogProperty(updatedProperty, org),
+	}
+}
+
+func newUpdateFormAuditLogEvent(updatedForm *dbgen.Form, updateRow *dbgen.UpdateFormRow, org *dbgen.Organization, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(updatedForm.ID),
+		TableName: TableNameForms,
+		OldValue:  newAuditLogOldForm(updatedForm, updateRow, org),
+		NewValue:  newAuditLogForm(updatedForm, org),
+	}
+}
+
+func newMoveFormAuditLogEvent(user *dbgen.User, form *dbgen.Form, oldOrgID int32, orgName string) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(form.ID),
+		TableName: TableNameForms,
+		OldValue:  &AuditLogForm{Name: form.Name, OrgID: oldOrgID},
+		NewValue:  &AuditLogForm{Name: form.Name, OrgID: form.OrgID.Int32, OrgName: orgName},
+	}
+}
+
+func newDeleteFormAuditLogEvent(form *dbgen.Form, org *dbgen.Organization, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionSoftDelete,
+		EntityID:  int64(form.ID),
+		TableName: TableNameForms,
+		OldValue:  newAuditLogForm(form, org),
+		NewValue:  nil,
+	}
+}
+
+func newDeletePropertyAuditLogEvent(property *dbgen.Property, org *dbgen.Organization, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionSoftDelete,
+		EntityID:  int64(property.ID),
+		TableName: TableNameProperties,
+		OldValue:  newAuditLogProperty(property, org),
+		NewValue:  nil,
+	}
+}
+
+func newUpdateOrgAuditLogEvent(user *dbgen.User, org *dbgen.Organization, oldName string) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgs,
+		OldValue:  &AuditLogOrg{Name: oldName},
+		NewValue:  &AuditLogOrg{Name: org.Name},
+	}
+}
+
+func newTransferOrgAuditLogEvent(user *dbgen.User, org *dbgen.Organization, newOwner *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgs,
+		OldValue:  NewAuditLogOrg(org),
+		NewValue:  &AuditLogOrg{ID: org.ID, Name: org.Name, NewOwnerID: newOwner.ID, NewOwnerEmail: newOwner.Email},
+	}
+}
+
+type AuditLogOrgUser struct {
+	OrgName string `json:"org_name,omitempty"`
+	UserID  int32  `json:"user_id,omitempty"`
+	Email   string `json:"email,omitempty"`
+	Level   string `json:"level,omitempty"`
+}
+
+func newAuditLogOrgUser(user *dbgen.User, orgName string, level string) *AuditLogOrgUser {
+	return &AuditLogOrgUser{
+		OrgName: orgName,
+		UserID:  user.ID,
+		Email:   user.Email,
+		Level:   level,
+	}
+}
+
+func newOrgInviteAuditLogEvent(user *dbgen.User, org *dbgen.Organization, inviteUser *dbgen.User) *common.AuditLogEvent {
+	// this one is bit tough (we kind of need 1 more "entity id" field), but our logic is that for audit log we record
+	// "who did what with what" so org owner invited to org <user>
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionCreate,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgUsers,
+		OldValue:  nil,
+		NewValue:  newAuditLogOrgUser(inviteUser, org.Name, string(dbgen.AccessLevelInvited)),
+	}
+}
+
+func newOrgEmailInviteAuditLogEvent(user *dbgen.User, org *dbgen.Organization, inviteEmail string) *common.AuditLogEvent {
+	// Similar to newOrgInviteAuditLogEvent but for email-only invites where user doesn't exist yet
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionCreate,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgUsers,
+		OldValue:  nil,
+		NewValue:  &AuditLogOrgUser{OrgName: org.Name, Email: inviteEmail, Level: string(dbgen.AccessLevelInvited)},
+	}
+}
+
+func newOrgMemberDeleteAuditLogEvent(user *dbgen.User, org *dbgen.Organization, userID int32, email string) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionDelete,
+		EntityID:  int64(org.ID),
+		TableName: TableNameOrgUsers,
+		OldValue:  &AuditLogOrgUser{OrgName: org.Name, UserID: userID, Email: email},
+		NewValue:  nil,
+	}
+}
+
+func newOrgMemberAuditLogEvent(orgID int32, orgName string, user *dbgen.User, action common.AuditLogAction, level string) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    action,
+		EntityID:  int64(orgID),
+		TableName: TableNameOrgUsers,
+		OldValue:  nil,
+		NewValue:  newAuditLogOrgUser(user, orgName, level),
+	}
+}
+
+func newOrgOwnershipSwapAuditLogEvent(orgID int32, orgName string, actor *dbgen.User, oldOwner *dbgen.User, newOwner *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    actor.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(orgID),
+		TableName: TableNameOrgUsers,
+		OldValue:  newAuditLogOrgUser(newOwner, orgName, string(dbgen.AccessLevelMember)),
+		NewValue:  newAuditLogOrgUser(oldOwner, orgName, string(dbgen.AccessLevelMember)),
+	}
+}
+
+type AuditLogAPIKey struct {
+	Name              string          `json:"name,omitempty"`
+	ExternalID        string          `json:"external_id,omitempty"`
+	Enabled           bool            `json:"enabled,omitempty"`
+	RequestsPerSecond float64         `json:"requests_per_second,omitempty"`
+	RequestsBurst     int32           `json:"requests_burst,omitempty"`
+	ExpiresAt         common.JSONTime `json:"expires_at,omitempty"`
+	Notes             string          `json:"notes,omitempty"`
+	Period            time.Duration   `json:"period,omitempty"`
+	Scope             string          `json:"scope,omitempty"`
+	OrgName           string          `json:"org_name,omitempty"`
+	ReadOnly          bool            `json:"readonly,omitempty"`
+}
+
+func newAuditLogAPIKey(key *dbgen.APIKey, orgName string) *AuditLogAPIKey {
+	if key == nil {
+		return nil
+	}
+
+	return &AuditLogAPIKey{
+		Name:              key.Name,
+		Enabled:           key.Enabled.Bool,
+		RequestsPerSecond: key.RequestsPerSecond,
+		RequestsBurst:     key.RequestsBurst,
+		ExpiresAt:         common.JSONTime(key.ExpiresAt.Time),
+		Notes:             key.Notes.String,
+		Period:            key.Period,
+		Scope:             string(key.Scope),
+		OrgName:           orgName,
+		ReadOnly:          key.Readonly,
+	}
+}
+
+func newAPIKeyAuditLogEvent(user *dbgen.User, apiKey *dbgen.APIKey, action common.AuditLogAction, orgName string) *common.AuditLogEvent {
+	event := &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    action,
+		EntityID:  int64(apiKey.ID),
+		TableName: TableNameAPIKeys,
+		OldValue:  nil,
+		NewValue:  nil,
+	}
+
+	switch action {
+	case common.AuditLogActionCreate, common.AuditLogActionRecover:
+		event.NewValue = newAuditLogAPIKey(apiKey, orgName)
+	case common.AuditLogActionDelete, common.AuditLogActionSoftDelete:
+		event.OldValue = newAuditLogAPIKey(apiKey, orgName)
+	}
+
+	return event
+}
+
+func newUpdateAPIKeyAuditLogEvent(user *dbgen.User, oldAPIKey, newAPIKey *dbgen.APIKey) *common.AuditLogEvent {
+	if (oldAPIKey == nil) && (newAPIKey == nil) {
+		return nil
+	}
+
+	entityKey := oldAPIKey
+	if entityKey == nil {
+		entityKey = newAPIKey
+	}
+
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(entityKey.ID),
+		TableName: TableNameAPIKeys,
+		OldValue:  newAuditLogAPIKey(oldAPIKey, ""),
+		NewValue:  newAuditLogAPIKey(newAPIKey, ""),
+	}
+}
+
+func newMovePropertyAuditLogEvent(user *dbgen.User, property *dbgen.Property, oldOrgID, newOrgID int32) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(property.ID),
+		TableName: TableNameProperties,
+		OldValue:  &AuditLogProperty{OrgID: oldOrgID},
+		NewValue:  &AuditLogProperty{OrgID: newOrgID},
+	}
+}
+
+type AuditLogAccess struct {
+	View       string `json:"view,omitempty"`
+	EntityName string `json:"name,omitempty"`
+}
+
+type AuditLogUserSettings struct {
+	WeeklyReport       bool    `json:"weekly_report"`
+	MonthlyReport      bool    `json:"monthly_report"`
+	NotificationsEmail *string `json:"notifications_email,omitempty"`
+}
+
+type AuditLogDifficultyRule struct {
+	Name                     string  `json:"name,omitempty"`
+	PropertyID               int32   `json:"property_id,omitempty"`
+	OrgID                    int32   `json:"org_id,omitempty"`
+	ConditionProperty        string  `json:"condition_property,omitempty"`
+	ConditionOperator        string  `json:"condition_operator,omitempty"`
+	ConditionValueStr        string  `json:"condition_value_str,omitempty"`
+	ConditionValueInt        int32   `json:"condition_value_int,omitempty"`
+	Position                 float64 `json:"position,omitempty"`
+	ActionProperty           string  `json:"action_property,omitempty"`
+	ActionValue              int32   `json:"action_value,omitempty"`
+	Enabled                  bool    `json:"enabled"`
+	ConditionOperatorNegated bool    `json:"condition_operator_negated"`
+	Terminal                 bool    `json:"terminal"`
+}
+
+func NewAuditLogDifficultyRule(rule *dbgen.DifficultyRule) *AuditLogDifficultyRule {
+	if rule == nil {
+		return nil
+	}
+
+	event := &AuditLogDifficultyRule{
+		Name:                     rule.Name,
+		Enabled:                  rule.Enabled,
+		ConditionProperty:        string(rule.ConditionProperty),
+		ConditionOperator:        string(rule.ConditionOperator),
+		ConditionOperatorNegated: rule.ConditionOperatorNegated,
+		Position:                 rule.Position,
+		ActionProperty:           string(rule.ActionProperty),
+		ActionValue:              rule.ActionValue,
+		Terminal:                 rule.Terminal,
+	}
+
+	if rule.PropertyID.Valid {
+		event.PropertyID = rule.PropertyID.Int32
+	}
+	if rule.OrgID.Valid {
+		event.OrgID = rule.OrgID.Int32
+	}
+	if rule.ConditionValueStr.Valid {
+		event.ConditionValueStr = rule.ConditionValueStr.String
+	}
+	if rule.ConditionValueInt.Valid {
+		event.ConditionValueInt = rule.ConditionValueInt.Int32
+	}
+
+	return event
+}
+
+func newOldDifficultyRuleFromUpdate(result *dbgen.UpdateDifficultyRuleRow) *dbgen.DifficultyRule {
+	if result == nil {
+		return nil
+	}
+
+	return &dbgen.DifficultyRule{
+		ID:                       result.ID,
+		Name:                     result.OldName,
+		PropertyID:               result.PropertyID,
+		OrgID:                    result.OrgID,
+		CreatorID:                result.CreatorID,
+		Enabled:                  result.OldEnabled,
+		ConditionProperty:        result.OldConditionProperty,
+		ConditionOperator:        result.OldConditionOperator,
+		ConditionOperatorNegated: result.OldConditionOperatorNegated,
+		ConditionValueStr:        result.OldConditionValueStr,
+		ConditionValueInt:        result.OldConditionValueInt,
+		Position:                 result.OldPosition,
+		ActionProperty:           result.OldActionProperty,
+		ActionValue:              result.OldActionValue,
+		Terminal:                 result.OldTerminal,
+	}
+}
+
+func newUpdateRuleAuditLogEvent(updatedRule *dbgen.DifficultyRule, result *dbgen.UpdateDifficultyRuleRow, user *dbgen.User) *common.AuditLogEvent {
+	oldRule := newOldDifficultyRuleFromUpdate(result)
+
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionUpdate,
+		EntityID:  int64(updatedRule.ID),
+		TableName: TableNameDifficultyRules,
+		OldValue:  NewAuditLogDifficultyRule(oldRule),
+		NewValue:  NewAuditLogDifficultyRule(updatedRule),
+	}
+}
+
+func newDeleteRuleAuditLogEvent(rule *dbgen.DifficultyRule, user *dbgen.User) *common.AuditLogEvent {
+	return &common.AuditLogEvent{
+		UserID:    user.ID,
+		Action:    common.AuditLogActionDelete,
+		EntityID:  int64(rule.ID),
+		TableName: TableNameDifficultyRules,
+		OldValue:  NewAuditLogDifficultyRule(rule),
+		NewValue:  nil,
+	}
+}

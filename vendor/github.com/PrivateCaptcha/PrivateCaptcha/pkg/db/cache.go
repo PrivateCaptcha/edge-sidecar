@@ -1,0 +1,611 @@
+package db
+
+import (
+	"context"
+	"encoding/gob"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+	dbgen "github.com/PrivateCaptcha/PrivateCaptcha/pkg/db/generated"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/rules"
+
+	"github.com/maypok86/otter/v2"
+	"github.com/maypok86/otter/v2/stats"
+)
+
+var (
+	ErrNegativeCacheHit    = errors.New("negative hit")
+	ErrCacheMiss           = errors.New("cache miss")
+	ErrSetMissing          = errors.New("cannot set missing value directly")
+	errEmptyCacheKeyPrefix = errors.New("cache key prefix is empty")
+)
+
+type CacheMissingValue struct{}
+
+type memcache[TKey comparable, TValue comparable] struct {
+	name    string
+	store   *otter.Cache[TKey, TValue]
+	counter *stats.Counter
+	// TODO: Evaluate storing negative cache separately from the main one
+	// with much smaller max size
+	missingValue TValue
+	missingTTL   time.Duration
+}
+
+type pcOtterLogger struct{}
+
+func (pcOtterLogger) Warn(ctx context.Context, msg string, err error) {
+	slog.WarnContext(ctx, msg, "source", "otter", common.ErrAttr(err))
+}
+func (pcOtterLogger) Error(ctx context.Context, msg string, err error) {
+	slog.ErrorContext(ctx, msg, "source", "otter", common.ErrAttr(err))
+}
+
+type OtterCacheOption[TKey comparable, TValue comparable] func(*otter.Options[TKey, TValue])
+
+type memoryCacheExpiryCalculator[TKey comparable, TValue comparable] struct {
+	expiryTTL    time.Duration
+	missingTTL   time.Duration
+	missingValue TValue
+}
+
+func newMemoryCacheExpiryCalculator[TKey comparable, TValue comparable](expiryTTL, missingTTL time.Duration, missingValue TValue) otter.ExpiryCalculator[TKey, TValue] {
+	return memoryCacheExpiryCalculator[TKey, TValue]{
+		expiryTTL:    expiryTTL,
+		missingTTL:   missingTTL,
+		missingValue: missingValue,
+	}
+}
+
+func (c memoryCacheExpiryCalculator[TKey, TValue]) ExpireAfterCreate(entry otter.Entry[TKey, TValue]) time.Duration {
+	if entry.Value == c.missingValue {
+		return c.missingTTL
+	}
+
+	return c.expiryTTL
+}
+
+func (c memoryCacheExpiryCalculator[TKey, TValue]) ExpireAfterUpdate(entry otter.Entry[TKey, TValue], _ TValue) time.Duration {
+	if entry.Value == c.missingValue {
+		return entry.ExpiresAfter()
+	}
+
+	return c.expiryTTL
+}
+
+func (c memoryCacheExpiryCalculator[TKey, TValue]) ExpireAfterRead(entry otter.Entry[TKey, TValue]) time.Duration {
+	if entry.Value == c.missingValue {
+		return entry.ExpiresAfter()
+	}
+
+	return c.expiryTTL
+}
+
+func NewMemoryCache[TKey comparable, TValue comparable](name string, maxCacheSize int, missingValue TValue, expiryTTL, refreshTTL, missingTTL time.Duration) (*memcache[TKey, TValue], error) {
+	return NewMemoryCacheEx[TKey, TValue](name, maxCacheSize, missingValue, missingTTL,
+		func(o *otter.Options[TKey, TValue]) {
+			o.ExpiryCalculator = newMemoryCacheExpiryCalculator[TKey, TValue](expiryTTL, missingTTL, missingValue)
+			o.RefreshCalculator = otter.RefreshWriting[TKey, TValue](refreshTTL)
+		})
+}
+
+func NewMemoryCacheEx[TKey comparable, TValue comparable](
+	name string,
+	maxCacheSize int,
+	missingValue TValue,
+	missingTTL time.Duration,
+	opts ...OtterCacheOption[TKey, TValue],
+) (*memcache[TKey, TValue], error) {
+
+	counter := stats.NewCounter()
+
+	// Defaults
+	cfg := &otter.Options[TKey, TValue]{
+		MaximumSize:     maxCacheSize,
+		InitialCapacity: max(100, maxCacheSize/1000),
+		StatsRecorder:   counter,
+		Logger:          &pcOtterLogger{},
+	}
+
+	// Apply user-supplied overrides
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	store, err := otter.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &memcache[TKey, TValue]{
+		name:         name,
+		store:        store,
+		counter:      counter,
+		missingValue: missingValue,
+		missingTTL:   missingTTL,
+	}, nil
+}
+
+var _ common.Cache[int, any] = (*memcache[int, any])(nil)
+
+func (c *memcache[TKey, TValue]) Missing() TValue {
+	return c.missingValue
+}
+
+func (c *memcache[TKey, TValue]) HitRatio() float64 {
+	return c.counter.Snapshot().HitRatio()
+}
+
+func (c *memcache[TKey, TValue]) GetWithRefresh(ctx context.Context, key TKey) (TValue, bool, error) {
+	entry, ok := c.store.GetEntry(key)
+	if !ok {
+		slog.Log(ctx, common.LevelTrace, "Item not found in memory cache", "cache", c.name, "key", key)
+		var zero TValue
+		return zero, false, ErrCacheMiss
+	}
+
+	if entry.Value == c.missingValue {
+		slog.Log(ctx, common.LevelTrace, "Item set as missing in memory cache", "cache", c.name, "key", key)
+		var zero TValue
+		return zero, false, ErrNegativeCacheHit
+	}
+
+	needsRefresh := entry.RefreshableAfter() <= 0
+
+	slog.Log(ctx, common.LevelTrace, "Found item in memory cache", "cache", c.name, "key", key, "needsRefresh", needsRefresh)
+
+	return entry.Value, needsRefresh, nil
+}
+
+func (c *memcache[TKey, TValue]) Get(ctx context.Context, key TKey) (TValue, error) {
+	data, found := c.store.GetIfPresent(key)
+	if !found {
+		slog.Log(ctx, common.LevelTrace, "Item not found in memory cache", "cache", c.name, "key", key)
+		var zero TValue
+		return zero, ErrCacheMiss
+	}
+
+	if data == c.missingValue {
+		slog.Log(ctx, common.LevelTrace, "Item set as missing in memory cache", "cache", c.name, "key", key)
+		var zero TValue
+		return zero, ErrNegativeCacheHit
+	}
+
+	slog.Log(ctx, common.LevelTrace, "Found item in memory cache", "cache", c.name, "key", key)
+
+	return data, nil
+}
+
+func (c *memcache[TKey, TValue]) GetEx(ctx context.Context, key TKey, loader common.CacheLoader[TKey, TValue]) (TValue, error) {
+	data, err := c.store.Get(ctx, key, loader)
+	if err != nil {
+		if errors.Is(err, otter.ErrNotFound) {
+			slog.Log(ctx, common.LevelTrace, "Item not found in memory cache", "cache", c.name, "key", key)
+
+			var zero TValue
+			return zero, ErrCacheMiss
+		}
+
+		slog.ErrorContext(ctx, "Failed to get item from memory cache", "cache", c.name, "key", key, common.ErrAttr(err))
+
+		return data, err
+	}
+
+	if data == c.missingValue {
+		// we force-set TTL as it means loader function returned missing value, in contrast to using function SetMission()
+		c.store.SetExpiresAfter(key, c.missingTTL)
+		slog.Log(ctx, common.LevelTrace, "Item set as missing in memory cache", "cache", c.name, "key", key)
+		var zero TValue
+		return zero, ErrNegativeCacheHit
+	}
+
+	slog.Log(ctx, common.LevelTrace, "Found item in memory cache", "cache", c.name, "key", key)
+
+	return data, nil
+}
+
+func (c *memcache[TKey, TValue]) SetMissing(ctx context.Context, key TKey) error {
+	c.store.Set(key, c.missingValue)
+	c.store.SetExpiresAfter(key, c.missingTTL)
+
+	slog.Log(ctx, common.LevelTrace, "Set item as missing in memory cache", "cache", c.name, "key", key)
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) Set(ctx context.Context, key TKey, t TValue) error {
+	if t == c.missingValue {
+		return ErrSetMissing
+	}
+
+	c.store.Set(key, t)
+
+	slog.Log(ctx, common.LevelTrace, "Saved item to memory cache", "cache", c.name, "key", key)
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) SetIfAbsent(ctx context.Context, key TKey, t TValue) error {
+	_, inserted := c.store.SetIfAbsent(key, t)
+	if !inserted {
+		return nil
+	}
+
+	if t == c.missingValue {
+		slog.Log(ctx, common.LevelTrace, "Set item as missing in memory cache", "cache", c.name, "key", key)
+	} else {
+		slog.Log(ctx, common.LevelTrace, "Saved item to memory cache", "cache", c.name, "key", key)
+	}
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) SetEx(ctx context.Context, key TKey, t TValue, ttl, refresh time.Duration) error {
+	if t == c.missingValue {
+		return ErrSetMissing
+	}
+
+	c.store.Set(key, t)
+	if ttl > 0 {
+		c.store.SetExpiresAfter(key, ttl)
+	}
+	if refresh > 0 {
+		c.store.SetRefreshableAfter(key, refresh)
+	}
+
+	slog.Log(ctx, common.LevelTrace, "Saved item to memory cache", "cache", c.name, "key", key, "ttl", ttl, "refresh", refresh)
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) SetTTL(ctx context.Context, key TKey, ttl time.Duration) error {
+	c.store.SetExpiresAfter(key, ttl)
+
+	slog.Log(ctx, common.LevelTrace, "Set item TTL", "cache", c.name, "key", key, "ttl", ttl)
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) SetRefresh(ctx context.Context, key TKey, ttl time.Duration) error {
+	c.store.SetRefreshableAfter(key, ttl)
+
+	slog.Log(ctx, common.LevelTrace, "Set item refresh", "cache", c.name, "key", key, "ttl", ttl)
+
+	return nil
+}
+
+func (c *memcache[TKey, TValue]) Delete(ctx context.Context, key TKey) bool {
+	_, found := c.store.Invalidate(key)
+
+	slog.Log(ctx, common.LevelTrace, "Deleted item from memory cache", "cache", c.name, "key", key, "found", found)
+
+	return found
+}
+
+func (c *memcache[TKey, TValue]) SaveTo(ctx context.Context, w io.Writer, maxItems int) error {
+	_, err := common.SaveCacheToWriter(ctx, w, c.store, maxItems, nil)
+	return err
+}
+
+func (c *memcache[TKey, TValue]) LoadFrom(ctx context.Context, r io.Reader, ttl time.Duration) error {
+	return common.LoadCacheFromReader(ctx, r, c.store, ttl)
+}
+
+func (c *memcache[TKey, TValue]) Clear() {
+	c.store.InvalidateAll()
+}
+
+type CacheKeyPrefix byte
+
+const (
+	// IMPORTANT: add new fields ONLY to the end
+	userCacheKeyPrefix CacheKeyPrefix = iota
+	apiKeyCacheKeyPrefix
+	orgCacheKeyPrefix
+	orgPropertiesCacheKeyPrefix
+	propertyByIDCacheKeyPrefix
+	propertyBySitekeyCacheKeyPrefix
+	userOrgsCacheKeyPrefix
+	orgUsersCacheKeyPrefix
+	userAPIKeysCacheKeyPrefix
+	subscriptionCacheKeyPrefix
+	notificationCacheKeyPrefix
+	templateCacheKeyPrefix
+	retiredSessionCacheKeyPrefix
+	userAuditLogsCacheKeyPrefix
+	propertyAuditLogsCacheKeyPrefix
+	orgAuditLogsCacheKeyPrefix
+	userPropertiesCountCacheKeyPrefix
+	userAccountStatsCacheKeyPrefix
+	propertyStatsCacheKeyPrefix
+	asyncTaskCacheKeyPrefix
+	orgPropertiesCountCacheKeyPrefix
+	orgInviteCacheKeyPrefix
+	compiledPropertyRulesCacheKeyPrefix
+	compiledOrgRulesCacheKeyPrefix
+	rawPropertyRulesCacheKeyPrefix
+	rawOrgRulesCacheKeyPrefix
+	difficultyRuleCacheKeyPrefix
+	propertyRuleStatsCacheKeyPrefix
+	userSettingsCacheKeyPrefix
+	orgFormsCacheKeyPrefix
+	orgFormsCountCacheKeyPrefix
+	formByExternalIDCacheKeyPrefix
+	formCacheKeyPrefix
+	formStatsCacheKeyPrefix
+	formAuditLogsCacheKeyPrefix
+	userFormsCountCacheKeyPrefix
+	orgSearchCacheKeyPrefix
+	orgStatsCacheKeyPrefix
+	edgeSettingsBySitekeyCacheKeyPrefix
+	// IMPORTANT: add new fields ONLY to the end
+	// Add new fields _above_
+	CACHE_KEY_PREFIXES_COUNT
+)
+
+var (
+	cachePrefixToStrings []string
+	cachePrefixMux       sync.Mutex
+)
+
+func init() {
+	cachePrefixMux.Lock()
+	defer cachePrefixMux.Unlock()
+
+	if len(cachePrefixToStrings) < int(CACHE_KEY_PREFIXES_COUNT) {
+		cachePrefixToStrings = make([]string, CACHE_KEY_PREFIXES_COUNT)
+	}
+
+	cachePrefixToStrings[userCacheKeyPrefix] = "user/"
+	cachePrefixToStrings[apiKeyCacheKeyPrefix] = "apikey/"
+	cachePrefixToStrings[orgCacheKeyPrefix] = "org/"
+	cachePrefixToStrings[orgPropertiesCacheKeyPrefix] = "orgProperties/"
+	cachePrefixToStrings[propertyByIDCacheKeyPrefix] = "propID/"
+	cachePrefixToStrings[propertyBySitekeyCacheKeyPrefix] = "propSitekey/"
+	cachePrefixToStrings[userOrgsCacheKeyPrefix] = "userOrgs/"
+	cachePrefixToStrings[orgUsersCacheKeyPrefix] = "orgUsers/"
+	cachePrefixToStrings[userAPIKeysCacheKeyPrefix] = "userApiKeys/"
+	cachePrefixToStrings[subscriptionCacheKeyPrefix] = "subscr/"
+	cachePrefixToStrings[notificationCacheKeyPrefix] = "notif/"
+	cachePrefixToStrings[templateCacheKeyPrefix] = "template/"
+	cachePrefixToStrings[userAuditLogsCacheKeyPrefix] = "userAuditLogs/"
+	cachePrefixToStrings[propertyAuditLogsCacheKeyPrefix] = "propAuditLogs/"
+	cachePrefixToStrings[orgAuditLogsCacheKeyPrefix] = "orgAuditLogs/"
+	cachePrefixToStrings[userPropertiesCountCacheKeyPrefix] = "userPropertiesCount/"
+	cachePrefixToStrings[userAccountStatsCacheKeyPrefix] = "userAccountStats/"
+	cachePrefixToStrings[propertyStatsCacheKeyPrefix] = "propertyStats/"
+	cachePrefixToStrings[asyncTaskCacheKeyPrefix] = "asyncTask/"
+	cachePrefixToStrings[orgPropertiesCountCacheKeyPrefix] = "orgPropertiesCount/"
+	cachePrefixToStrings[orgFormsCacheKeyPrefix] = "orgForms/"
+	cachePrefixToStrings[orgFormsCountCacheKeyPrefix] = "orgFormsCount/"
+	cachePrefixToStrings[orgInviteCacheKeyPrefix] = "orgInvite/"
+	cachePrefixToStrings[compiledPropertyRulesCacheKeyPrefix] = "compiledPropRules/"
+	cachePrefixToStrings[compiledOrgRulesCacheKeyPrefix] = "compiledOrgRules/"
+	cachePrefixToStrings[rawPropertyRulesCacheKeyPrefix] = "rawPropRules/"
+	cachePrefixToStrings[rawOrgRulesCacheKeyPrefix] = "rawOrgRules/"
+	cachePrefixToStrings[difficultyRuleCacheKeyPrefix] = "diffRule/"
+	cachePrefixToStrings[propertyRuleStatsCacheKeyPrefix] = "propertyRuleStats/"
+	cachePrefixToStrings[userSettingsCacheKeyPrefix] = "userSettings/"
+	cachePrefixToStrings[formByExternalIDCacheKeyPrefix] = "formExternalID/"
+	cachePrefixToStrings[formCacheKeyPrefix] = "form/"
+	cachePrefixToStrings[formStatsCacheKeyPrefix] = "formStats/"
+	cachePrefixToStrings[formAuditLogsCacheKeyPrefix] = "formAuditLogs/"
+	cachePrefixToStrings[userFormsCountCacheKeyPrefix] = "userFormsCount/"
+	cachePrefixToStrings[orgSearchCacheKeyPrefix] = "orgSearch/"
+	cachePrefixToStrings[orgStatsCacheKeyPrefix] = "orgStats/"
+	cachePrefixToStrings[edgeSettingsBySitekeyCacheKeyPrefix] = "edgeSitekey/"
+
+	for i, v := range cachePrefixToStrings {
+		if len(v) == 0 && i != int(retiredSessionCacheKeyPrefix) {
+			panic(fmt.Sprintf("found unconfigured cache prefix value for key: %v", i))
+		}
+	}
+
+	gob.Register(CacheKey{})
+	gob.Register(&dbgen.Property{})
+	gob.Register(&dbgen.GetEdgeSettingsBySitekeyRow{})
+	gob.Register([]*dbgen.SearchOrgRow{})
+	gob.Register(&dbgen.User{})
+	gob.Register(&dbgen.UserSettings{})
+	gob.Register(&dbgen.Organization{})
+	gob.Register(&dbgen.Subscription{})
+	gob.Register(&dbgen.DifficultyRule{})
+	gob.Register(&dbgen.APIKey{})
+	gob.Register(&dbgen.Form{})
+	gob.Register(&dbgen.AsyncTask{})
+	gob.Register(&dbgen.SystemNotification{})
+	gob.Register(&dbgen.OrganizationUser{})
+	gob.Register(&rules.CompiledRules{})
+	gob.Register(&dbgen.NotificationTemplate{})
+	gob.Register([]*dbgen.DifficultyRule{})
+	gob.Register([]*dbgen.GetUserOrganizationsRow{})
+	gob.Register([]*dbgen.GetOrganizationStatsRow{})
+	gob.Register([]*dbgen.GetOrganizationUsersRow{})
+	gob.Register([]*dbgen.GetPropertyAuditLogsRow{})
+	gob.Register([]*dbgen.GetOrgAuditLogsRow{})
+	gob.Register([]*dbgen.GetUserAuditLogsRow{})
+	gob.Register([]*dbgen.Property{})
+	gob.Register([]*dbgen.Form{})
+	gob.Register([]*dbgen.APIKey{})
+	gob.Register(&struct{}{})
+	gob.Register(&CacheMissingValue{})
+	gob.Register([]*common.TimeCount{})
+	gob.Register([]*common.OrgTimeCount{})
+	gob.Register([]*common.TimePeriodStat{})
+	gob.Register(&common.OrgTimePeriodStats{})
+	gob.Register([]*common.FormSubmitStat{})
+	gob.Register([]*dbgen.GetFormAuditLogsRow{})
+}
+
+func RegisterCachePrefixString(prefix CacheKeyPrefix, s string) error {
+	if len(s) == 0 {
+		return errEmptyCacheKeyPrefix
+	}
+
+	cachePrefixMux.Lock()
+	defer cachePrefixMux.Unlock()
+
+	if int(prefix) >= len(cachePrefixToStrings) {
+		newSlice := make([]string, int(prefix)+1)
+		copy(newSlice, cachePrefixToStrings)
+		cachePrefixToStrings = newSlice
+	}
+
+	if cachePrefixToStrings[prefix] != "" {
+		return fmt.Errorf("cache: duplicate registration for prefix %v", prefix)
+	}
+
+	cachePrefixToStrings[prefix] = s
+	return nil
+}
+
+// it's a "union" type which is better than doing string concatenation as before
+type CacheKey struct {
+	Prefix   CacheKeyPrefix
+	IntValue int32
+	StrValue string
+}
+
+func (ck CacheKey) String() string {
+	var prefix string
+	if int(ck.Prefix) < len(cachePrefixToStrings) {
+		prefix = cachePrefixToStrings[ck.Prefix]
+	}
+
+	if len(ck.StrValue) != 0 {
+		return prefix + ck.StrValue
+	}
+
+	return prefix + strconv.Itoa(int(ck.IntValue))
+}
+
+func (ck CacheKey) LogValue() slog.Value {
+	return slog.StringValue(ck.String())
+}
+
+func Int32CacheKey(prefix CacheKeyPrefix, value int32) CacheKey {
+	return CacheKey{
+		Prefix:   prefix,
+		IntValue: value,
+		StrValue: "",
+	}
+}
+
+func StringCacheKey(prefix CacheKeyPrefix, value string) CacheKey {
+	return CacheKey{
+		Prefix:   prefix,
+		IntValue: 0,
+		StrValue: value,
+	}
+}
+
+func UserCacheKey(id int32) CacheKey     { return Int32CacheKey(userCacheKeyPrefix, id) }
+func APIKeyCacheKey(str string) CacheKey { return StringCacheKey(apiKeyCacheKeyPrefix, str) }
+func orgCacheKey(orgID int32) CacheKey   { return Int32CacheKey(orgCacheKeyPrefix, orgID) }
+func OrgPropertiesCacheKey(orgID int32, key string) CacheKey {
+	return CacheKey{Prefix: orgPropertiesCacheKeyPrefix, IntValue: orgID, StrValue: key}
+}
+func OrgFormsCacheKey(orgID int32, key string) CacheKey {
+	return CacheKey{Prefix: orgFormsCacheKeyPrefix, IntValue: orgID, StrValue: key}
+}
+func orgSearchCacheKey(orgID int32, searchTerm string, limit int) CacheKey {
+	return CacheKey{Prefix: orgSearchCacheKeyPrefix, IntValue: orgID, StrValue: fmt.Sprintf("%s/%d", searchTerm, limit)}
+}
+func PropertyByIDCacheKey(propID int32) CacheKey {
+	return Int32CacheKey(propertyByIDCacheKeyPrefix, propID)
+}
+func PropertyBySitekeyCacheKey(sitekey string) CacheKey {
+	return StringCacheKey(propertyBySitekeyCacheKeyPrefix, sitekey)
+}
+func EdgeSettingsBySitekeyCacheKey(sitekey string) CacheKey {
+	return StringCacheKey(edgeSettingsBySitekeyCacheKeyPrefix, sitekey)
+}
+func UserOrgsCacheKey(userID int32) CacheKey { return Int32CacheKey(userOrgsCacheKeyPrefix, userID) }
+func orgUsersCacheKey(orgID int32) CacheKey  { return Int32CacheKey(orgUsersCacheKeyPrefix, orgID) }
+func UserAPIKeysCacheKey(userID int32) CacheKey {
+	return Int32CacheKey(userAPIKeysCacheKeyPrefix, userID)
+}
+func SubscriptionCacheKey(sID int32) CacheKey { return Int32CacheKey(subscriptionCacheKeyPrefix, sID) }
+func notificationCacheKey(ID int32) CacheKey  { return Int32CacheKey(notificationCacheKeyPrefix, ID) }
+func templateCacheKey(str string) CacheKey    { return StringCacheKey(templateCacheKeyPrefix, str) }
+func userAuditLogsCacheKey(userID int32, key string) CacheKey {
+	return CacheKey{Prefix: userAuditLogsCacheKeyPrefix, IntValue: userID, StrValue: key}
+}
+func propertyAuditLogsCacheKey(propID int32) CacheKey {
+	return CacheKey{Prefix: propertyAuditLogsCacheKeyPrefix, IntValue: propID}
+}
+func orgAuditLogsCacheKey(orgID int32) CacheKey {
+	return CacheKey{Prefix: orgAuditLogsCacheKeyPrefix, IntValue: orgID}
+}
+func userPropertiesCountCacheKey(userID int32) CacheKey {
+	return Int32CacheKey(userPropertiesCountCacheKeyPrefix, userID)
+}
+func userFormsCountCacheKey(userID int32) CacheKey {
+	return Int32CacheKey(userFormsCountCacheKeyPrefix, userID)
+}
+func userAccountStatsCacheKey(userID int32, key string) CacheKey {
+	return CacheKey{Prefix: userAccountStatsCacheKeyPrefix, IntValue: userID, StrValue: key}
+}
+func propertyStatsCacheKey(propertyID int32, key string) CacheKey {
+	return CacheKey{Prefix: propertyStatsCacheKeyPrefix, IntValue: propertyID, StrValue: key}
+}
+func orgStatsCacheKey(orgID int32, key string) CacheKey {
+	return CacheKey{Prefix: orgStatsCacheKeyPrefix, IntValue: orgID, StrValue: key}
+}
+func FormStatsCacheKey(formID int32, key string) CacheKey {
+	return CacheKey{Prefix: formStatsCacheKeyPrefix, IntValue: formID, StrValue: key}
+}
+func asyncTaskCacheKey(key string) CacheKey {
+	return StringCacheKey(asyncTaskCacheKeyPrefix, key)
+}
+func orgPropertiesCountCacheKey(orgID int32) CacheKey {
+	return Int32CacheKey(orgPropertiesCountCacheKeyPrefix, orgID)
+}
+func orgFormsCountCacheKey(orgID int32) CacheKey {
+	return Int32CacheKey(orgFormsCountCacheKeyPrefix, orgID)
+}
+func orgInviteCacheKey(inviteID int32) CacheKey {
+	return Int32CacheKey(orgInviteCacheKeyPrefix, inviteID)
+}
+func CompiledPropertyRulesCacheKey(propertyID int32) CacheKey {
+	return Int32CacheKey(compiledPropertyRulesCacheKeyPrefix, propertyID)
+}
+func CompiledOrgRulesCacheKey(orgID int32) CacheKey {
+	return Int32CacheKey(compiledOrgRulesCacheKeyPrefix, orgID)
+}
+func RawPropertyRulesCacheKey(propertyID int32) CacheKey {
+	return Int32CacheKey(rawPropertyRulesCacheKeyPrefix, propertyID)
+}
+func RawOrgRulesCacheKey(orgID int32) CacheKey {
+	return Int32CacheKey(rawOrgRulesCacheKeyPrefix, orgID)
+}
+func DifficultyRuleCacheKey(ruleID int32) CacheKey {
+	return Int32CacheKey(difficultyRuleCacheKeyPrefix, ruleID)
+}
+func propertyRuleStatsCacheKey(propertyID int32, key string) CacheKey {
+	return CacheKey{Prefix: propertyRuleStatsCacheKeyPrefix, IntValue: propertyID, StrValue: key}
+}
+func UserSettingsCacheKey(userID int32) CacheKey {
+	return Int32CacheKey(userSettingsCacheKeyPrefix, userID)
+}
+func FormByExternalIDCacheKey(externalID string) CacheKey {
+	return StringCacheKey(formByExternalIDCacheKeyPrefix, externalID)
+}
+func formByIDCacheKey(formID int32) CacheKey {
+	return Int32CacheKey(formCacheKeyPrefix, formID)
+}
+func formAuditLogsCacheKey(propID int32) CacheKey {
+	return CacheKey{Prefix: formAuditLogsCacheKeyPrefix, IntValue: propID}
+}
+func orgPropertiesCacheKey(orgID int32, sort OrgPropertiesSort) CacheKey {
+	return OrgPropertiesCacheKey(orgID, string(sort))
+}
+func organizationStatsCacheKey(userID int32) CacheKey {
+	return userAccountStatsCacheKey(userID, organizationStatsCacheID)
+}

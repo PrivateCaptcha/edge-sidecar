@@ -1,0 +1,126 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "queries/postgres"
+    schema: "migrations/postgres"
+    database:
+      uri: "${PC_POSTGRES}"
+    analyzer:
+      database: false
+    rules:
+      - sqlc/db-prepare
+    gen:
+      go:
+        package: "generated"
+        sql_package: "pgx/v5"
+        out: "generated"
+        emit_interface: true
+        emit_db_tags: true
+        emit_json_tags: true
+        emit_result_struct_pointers: true
+        emit_params_struct_pointers: true
+        initialisms: ["id", "url"]
+        #emit_pointers_for_null_types: true
+        rename:
+          #"backend_(.*)": "$1"
+          backend_deleted_record: DeletedRecord
+          backend_apikey: "APIKey"
+          backend_subscription: Subscription
+          backend_user: User
+          backend_organization: Organization
+          backend_access_level: AccessLevel
+          backend_organization_user: OrganizationUser
+          backend_difficulty_growth: DifficultyGrowth
+          backend_property: Property
+          backend_cache: Cache
+          backend_form: Form
+          backend_form_method: FormMethod
+          backend_form_method_post: FormMethodPost
+          backend_form_method_put: FormMethodPut
+          backend_form_method_delete: FormMethodDelete
+          backend_form_method_patch: FormMethodPatch
+          backend_lock: Lock
+          backend_difficulty_growth_constant: DifficultyGrowthConstant
+          backend_difficulty_growth_slow: DifficultyGrowthSlow
+          backend_difficulty_growth_medium: DifficultyGrowthMedium
+          backend_difficulty_growth_fast: DifficultyGrowthFast
+          backend_challenge_type: ChallengeType
+          backend_challenge_type_blake2b: ChallengeTypeBlake2b
+          backend_challenge_type_argon2id: ChallengeTypeArgon2ID
+          backend_edge_widget_start_mode: EdgeWidgetStartMode
+          backend_edge_property_setting: EdgePropertySettings
+          backend_edge_widget_start_mode_click: EdgeWidgetStartModeClick
+          backend_edge_widget_start_mode_load: EdgeWidgetStartModeLoad
+          backend_access_level_member: AccessLevelMember
+          backend_access_level_invited: AccessLevelInvited
+          backend_access_level_owner: AccessLevelOwner
+          backend_system_notification: SystemNotification
+          backend_subscription_source: SubscriptionSource
+          backend_subscription_source_external: SubscriptionSourceExternal
+          backend_subscription_source_internal: SubscriptionSourceInternal
+          backend_notification_template: NotificationTemplate
+          backend_user_notification: UserNotification
+          backend_audit_log: AuditLog
+          backend_audit_log_action: AuditLogAction
+          backend_audit_log_action_create: AuditLogActionCreate
+          backend_audit_log_action_update: AuditLogActionUpdate
+          backend_audit_log_action_delete: AuditLogActionDelete
+          backend_audit_log_action_unknown: AuditLogActionUnknown
+          backend_audit_log_action_softdelete: AuditLogActionSoftDelete
+          backend_audit_log_action_recover: AuditLogActionRecover
+          backend_audit_log_action_login: AuditLogActionLogin
+          backend_audit_log_action_logout: AuditLogActionLogout
+          backend_audit_log_action_access: AuditLogActionAccess
+          backend_apikey_scope: ApiKeyScope
+          backend_apikey_scope_puzzle: ApiKeyScopePuzzle
+          backend_apikey_scope_portal: ApiKeyScopePortal
+          backend_audit_log_source: AuditLogSource
+          backend_audit_log_source_unknown: AuditLogSourceUnknown
+          backend_audit_log_source_portal: AuditLogSourcePortal
+          backend_audit_log_source_api: AuditLogSourceApi
+          backend_async_task: AsyncTask
+          backend_difficulty_rule: DifficultyRule
+          backend_rule_condition_property: RuleConditionProperty
+          backend_rule_condition_property_user_agent: RuleConditionPropertyUserAgent
+          backend_rule_condition_property_ip_address: RuleConditionPropertyIPAddress
+          backend_rule_condition_property_country_code: RuleConditionPropertyCountryCode
+          backend_rule_condition_property_domain: RuleConditionPropertyDomain
+          backend_rule_condition_property_http_header_name: RuleConditionPropertyHTTPHeaderName
+          backend_rule_condition_property_always: RuleConditionPropertyAlways
+          backend_rule_condition_property_browser_version: RuleConditionPropertyBrowserVersion
+          backend_rule_condition_operator: RuleConditionOperator
+          backend_rule_condition_operator_equals: RuleConditionOperatorEquals
+          backend_rule_condition_operator_contains: RuleConditionOperatorContains
+          backend_rule_condition_operator_matches: RuleConditionOperatorMatches
+          backend_rule_condition_operator_empty: RuleConditionOperatorEmpty
+          backend_rule_condition_operator_in: RuleConditionOperatorIn
+          backend_rule_condition_operator_bot: RuleConditionOperatorBot
+          backend_rule_condition_operator_more: RuleConditionOperatorMore
+          backend_rule_action_property: RuleActionProperty
+          backend_rule_action_property_difficulty_level_percent: RuleActionPropertyDifficultyLevelPercent
+          backend_rule_action_property_http_request: RuleActionPropertyHTTPRequest
+          backend_rule_action_property_difficulty_growth: RuleActionPropertyDifficultyGrowth
+          backend_rule_action_property_edge_token_validity_interval: RuleActionPropertyEdgeTokenValidityInterval
+          backend_rule_action_property_break: RuleActionPropertyBreak
+          backend_user_setting: UserSettings
+          backend_session: Session
+          backend_session_state: SessionState
+          backend_session_state_pending: SessionStatePending
+          backend_session_state_authenticated: SessionStateAuthenticated
+          backend_session_state_revoked: SessionStateRevoked
+          backend_session_challenge_kind: SessionChallengeKind
+          backend_session_challenge_kind_sign_in: SessionChallengeKindSignIn
+          backend_session_challenge_kind_registration: SessionChallengeKindRegistration
+          backend_session_challenge_kind_email_change: SessionChallengeKindEmailChange
+        overrides:
+          - db_type: "pg_catalog.interval"
+            go_type: "time.Duration"
+          - db_type: "pg_catalog.interval"
+            # It seems like this could be the simpler `go_type: "*time.Duration"`, but
+            # that outputs double points like `**time.Duration` for reasons that are
+            # beyond me (bug?). The expanded version of `go_type` usage below works.
+            go_type:
+              import: "time"
+              type: "Duration"
+              pointer: true
+            nullable: true

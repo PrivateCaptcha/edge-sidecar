@@ -1,0 +1,13 @@
+{
+  "name": "privatecaptcha-edge-sidecar-e2e",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0"
+  }
+}

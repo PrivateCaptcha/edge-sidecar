@@ -1,0 +1,49 @@
+name: privatecaptcha-edge-demo
+
+services:
+  privatecaptcha-authorizer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      STAGE: dev
+      PC_HOST: 0.0.0.0
+      PC_PORT: "8080"
+      PC_SITEKEY: ${PC_SITEKEY:?Set PC_SITEKEY in docker/.env}
+      PC_API_KEY: ${PC_API_KEY:?Set PC_API_KEY in docker/.env}
+      PC_API_BASE_URL: ${PC_API_BASE_URL:-https://api.privatecaptcha.com}
+      PC_ISSUER: ${PC_ISSUER:-https://api.privatecaptcha.com}
+      PC_JWKS_URL: ${PC_JWKS_URL:-https://api.privatecaptcha.com/.well-known/jwks.json}
+      PC_PROTECTED_ORIGIN: https://${PC_EDGE_HOST:-edge.privatecaptcha.test}:${PC_EDGE_PORT:-8443}
+      PC_TRUSTED_PROXY_HOSTS: caddy
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      PC_PROTECTED_SITE: https://${PC_EDGE_HOST:-edge.privatecaptcha.test}:${PC_EDGE_PORT:-8443}
+      PC_AUTH_UPSTREAM: privatecaptcha-authorizer:8080
+      PC_APP_UPSTREAM: app:8080
+    ports:
+      - "127.0.0.1:${PC_EDGE_PORT:-8443}:${PC_EDGE_PORT:-8443}"
+      - "127.0.0.1:2019:2019"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile.example:/etc/caddy/privatecaptcha-site.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - privatecaptcha-authorizer
+      - app
+
+  app:
+    image: caddy:2.11.7-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile.app:/etc/caddy/Caddyfile:ro
+
+volumes:
+  caddy_data:
+  caddy_config:

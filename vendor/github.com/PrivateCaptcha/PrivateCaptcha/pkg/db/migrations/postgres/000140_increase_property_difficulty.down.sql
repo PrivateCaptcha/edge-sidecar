@@ -1,0 +1,1 @@
+-- We don't migrate levels down because it was a one-way difficulty adjustment

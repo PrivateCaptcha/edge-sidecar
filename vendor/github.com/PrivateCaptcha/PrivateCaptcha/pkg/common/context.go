@@ -1,0 +1,24 @@
+package common
+
+type ContextKey int
+
+const (
+	TraceIDContextKey ContextKey = iota
+	PropertyContextKey
+	APIKeyContextKey
+	LoggedInContextKey
+	SessionContextKey
+	SitekeyContextKey
+	SecretContextKey
+	RateLimitKeyContextKey
+	SessionHashContextKey
+	ServiceContextKey
+	TimeContextKey
+	FormContextKey
+	FormIDContextKey
+	PathPatternContextKey
+	TipContextKey
+	EdgeSettingsContextKey
+	// Add new fields _above_
+	CONTEXT_KEYS_COUNT
+)

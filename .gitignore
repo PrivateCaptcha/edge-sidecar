@@ -17,6 +17,9 @@ coverage.*
 !coverage.go
 *.coverprofile
 profile.cov
+node_modules/
+test-results/
+playwright-report/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -27,6 +30,8 @@ go.work.sum
 
 # env file
 .env
+
+bin/
 
 # Editor/IDE
 # .idea/

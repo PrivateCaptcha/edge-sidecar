@@ -1,0 +1,30 @@
+{$PC_PROTECTED_SITE:example.com} {
+	handle /__privatecaptcha/complete {
+		reverse_proxy {$PC_AUTH_UPSTREAM:privatecaptcha-authorizer:8080} {
+			header_up X-Forwarded-Host {http.request.hostport}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-PC-Client-IP {remote_host}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 12s
+			}
+		}
+	}
+
+	handle {
+		forward_auth {$PC_AUTH_UPSTREAM:privatecaptcha-authorizer:8080} {
+			uri /auth
+			header_up X-Forwarded-Host {http.request.hostport}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Uri {uri}
+			header_up X-Forwarded-Method {method}
+			header_up X-PC-Client-IP {remote_host}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 12s
+			}
+		}
+
+		reverse_proxy {$PC_APP_UPSTREAM:app:8080}
+	}
+}

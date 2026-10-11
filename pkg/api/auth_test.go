@@ -1,0 +1,231 @@
+package api
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/config"
+	"github.com/golang-jwt/jwt/v5"
+)
+
+func TestMain(m *testing.M) {
+	if err := RegisterConfig(); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
+type edgeFixture struct {
+	s         Settings
+	key       *ecdsa.PrivateKey
+	keys      *KeyCache
+	a         *Authorizer
+	jwksCalls atomic.Int32
+}
+
+func testEnv() map[string]string {
+	return map[string]string{
+		"PC_SITEKEY":             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"PC_API_KEY":             "fixture-api-key",
+		"PC_PROTECTED_ORIGIN":    "https://example.com",
+		"PC_TRUSTED_PROXY_CIDRS": "127.0.0.1/32,::1/128",
+	}
+}
+
+func newEdgeFixture(t *testing.T) *edgeFixture {
+	t.Helper()
+	f := &edgeFixture{}
+	var err error
+	f.key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	point, err := f.key.PublicKey.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := jwk{
+		Kty: "EC",
+		Crv: "P-256",
+		Alg: keyAlgorithm,
+		Use: "sig",
+		Kid: "fixture-key",
+		X:   base64.RawURLEncoding.EncodeToString(point[1:33]),
+		Y:   base64.RawURLEncoding.EncodeToString(point[33:]),
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.jwksCalls.Add(1)
+		if r.URL.Path != "/.well-known/jwks.json" {
+			t.Errorf("unexpected key URL: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"keys": []jwk{key}})
+	}))
+	t.Cleanup(upstream.Close)
+	env := testEnv()
+	env["PC_JWKS_URL"] = upstream.URL + "/.well-known/jwks.json"
+	f.s, err = LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.keys = NewKeyCache(f.s)
+	t.Cleanup(f.keys.CloseIdleConnections)
+	if err := f.keys.RunOnce(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	f.a, err = NewAuthorizer(f.s, f.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func (f *edgeFixture) token(t *testing.T, changes jwt.MapClaims, headers map[string]any) string {
+	t.Helper()
+	now := time.Now().Unix()
+	claims := jwt.MapClaims{
+		"v":    1,
+		"iss":  f.s.issuer,
+		"aud":  f.s.sitekey,
+		"host": "example.com",
+		"iat":  now,
+		"exp":  now + 3600,
+	}
+	for name, value := range changes {
+		if value == nil {
+			delete(claims, name)
+		} else {
+			claims[name] = value
+		}
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["typ"] = edgeTokenType
+	token.Header["kid"] = "fixture-key"
+	for name, value := range headers {
+		if value == nil {
+			delete(token.Header, name)
+		} else {
+			token.Header[name] = value
+		}
+	}
+	signed, err := token.SignedString(f.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+func authRequest(token string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, "http://sidecar/auth", nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+	r.Header.Set(HeaderForwardedHost, "example.com")
+	r.Header.Set(HeaderForwardedProto, "https")
+	r.Header.Set(HeaderForwardedMethod, http.MethodGet)
+	r.Header.Set(HeaderForwardedURI, "/private?x=1")
+	r.Header.Set(common.HeaderClientIP, "192.0.2.1")
+	if token != "" {
+		r.AddCookie(&http.Cookie{
+			Name:  edgeCookieName,
+			Value: token,
+		})
+	}
+	return r
+}
+
+func TestEdgeSidecarProxy(t *testing.T) {
+	f := newEdgeFixture(t)
+	token := f.token(t, nil, nil)
+	for _, tc := range []struct {
+		name string
+		edit func(*http.Request)
+		want int
+	}{
+		{"Trusted", func(*http.Request) {}, 204},
+		{"Untrusted", func(r *http.Request) { r.RemoteAddr = "192.0.2.10:8080" }, 401},
+		{"WrongPort", func(r *http.Request) { r.Header.Set(HeaderForwardedHost, "example.com:8443") }, 401},
+		{"HTTP", func(r *http.Request) { r.Header.Set(HeaderForwardedProto, "http") }, 401},
+		{"DefaultPort", func(r *http.Request) { r.Header.Set(HeaderForwardedHost, "EXAMPLE.COM.:443") }, 204},
+		{"DuplicateHost", func(r *http.Request) { r.Header.Add(HeaderForwardedHost, "evil.com") }, 401},
+		{"HostURL", func(r *http.Request) { r.Header.Set(HeaderForwardedHost, "https://example.com") }, 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := authRequest(token)
+			tc.edit(r)
+			w := httptest.NewRecorder()
+			f.a.auth(w, r)
+			if w.Code != tc.want || w.Body.Len() != 0 || w.Header().Get(common.HeaderCacheControl) != cacheNoStore {
+				t.Fatalf("status=%d body=%q headers=%v", w.Code, w.Body.String(), w.Header())
+			}
+		})
+	}
+	if f.jwksCalls.Load() != 1 {
+		t.Fatal("normal authorization contacted JWKS")
+	}
+}
+
+func TestEdgeSidecarJWT(t *testing.T) {
+	f := newEdgeFixture(t)
+	for name, change := range map[string]jwt.MapClaims{
+		"Valid":          {},
+		"WrongSitekey":   {"aud": "wrong"},
+		"OriginAudience": {"aud": "https://example.com"},
+		"WrongHost":      {"host": "other.example"},
+		"WrongIssuer":    {"iss": "https://other.example"},
+		"Expired":        {"exp": time.Now().Add(-time.Minute).Unix()},
+		"Future":         {"iat": time.Now().Add(time.Minute).Unix()},
+		"MissingExpiry":  {"exp": nil},
+		"MissingIssued":  {"iat": nil},
+		"Version":        {"v": 2},
+		"TooLong":        {"exp": time.Now().Add(25 * time.Hour).Unix()},
+		"NotBefore":      {"nbf": time.Now().Add(time.Minute).Unix()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			f.a.auth(w, authRequest(f.token(t, change, nil)))
+			want := http.StatusUnauthorized
+			if name == "Valid" {
+				want = http.StatusNoContent
+			}
+			if w.Code != want {
+				t.Fatalf("got %d, want %d", w.Code, want)
+			}
+		})
+	}
+	for name, value := range map[string]any{"typ": "JWT", "kid": nil, "jku": "https://evil.example/key", "x5u": "https://evil.example/key", "jwk": map[string]any{}, "crit": []string{"b64"}} {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			f.a.auth(w, authRequest(f.token(t, nil, map[string]any{name: value})))
+			if w.Code != 401 {
+				t.Fatalf("got %d", w.Code)
+			}
+		})
+	}
+	parts := strings.Split(f.token(t, nil, nil), ".")
+	signature, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	signature[0] ^= 1
+	parts[2] = base64.RawURLEncoding.EncodeToString(signature)
+	for _, raw := range []string{strings.Join(parts, "."), "malformed", ""} {
+		w := httptest.NewRecorder()
+		f.a.auth(w, authRequest(raw))
+		if w.Code != 401 {
+			t.Fatalf("invalid token returned %d", w.Code)
+		}
+	}
+	unsigned := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{})
+	raw, _ := unsigned.SignedString(jwt.UnsafeAllowNoneSignatureType)
+	w := httptest.NewRecorder()
+	f.a.auth(w, authRequest(raw))
+	if w.Code != 401 {
+		t.Fatal("unsigned token accepted")
+	}
+}

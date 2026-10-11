@@ -1,0 +1,2822 @@
+package db
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"text/template"
+	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+)
+
+const (
+	VerifyLogTableName               = "privatecaptcha.verify_logs"
+	VerifyLogTable1h                 = "privatecaptcha.verify_logs_1h"
+	VerifyLogTable1d                 = "privatecaptcha.verify_logs_1d"
+	VerifyLogTable1mo                = "privatecaptcha.verify_logs_1mo"
+	AccessLogTableName               = "privatecaptcha.request_logs"
+	AccessLogTableName5m             = "privatecaptcha.request_logs_5m"
+	AccessLogTableName1h             = "privatecaptcha.request_logs_1h"
+	AccessLogTableName1d             = "privatecaptcha.request_logs_1d"
+	AccessLogTableName1mo            = "privatecaptcha.request_logs_1mo"
+	RulesLogsTableName1d             = "privatecaptcha.rules_logs_1d"
+	FormSubmitLogTableName           = "privatecaptcha.form_submit_logs"
+	FormSubmitLogTableName1h         = "privatecaptcha.form_submit_logs_1h"
+	FormSubmitLogTableName1d         = "privatecaptcha.form_submit_logs_1d"
+	FormSubmitLogTableName1mo        = "privatecaptcha.form_submit_logs_1mo"
+	PuzzleStatsOutcomesTable         = "privatecaptcha.puzzle_outcomes_recent"
+	PuzzleStatsIPDailyTable          = "privatecaptcha.puzzle_stats_ip_daily"
+	PuzzleStatsIPMonthlyTable        = "privatecaptcha.puzzle_stats_ip_monthly"
+	PuzzleStatsUserAgentDailyTable   = "privatecaptcha.puzzle_stats_user_agent_daily"
+	PuzzleStatsUserAgentMonthlyTable = "privatecaptcha.puzzle_stats_user_agent_monthly"
+	PuzzleStatsFingerprintDailyTable = "privatecaptcha.puzzle_stats_fingerprint_daily"
+
+	statsRefresh = 15 * time.Minute
+)
+
+var (
+	ErrUnsupportedPeriod       = errors.New("unsupported period")
+	ErrClickHouseNotConfigured = errors.New("clickhouse is not configured")
+)
+
+type TimeSeriesDB struct {
+	Clickhouse         *sql.DB
+	Cache              common.Cache[CacheKey, any]
+	statsQueryTemplate *template.Template
+	maintenanceMode    atomic.Bool
+}
+
+var _ common.TimeSeriesStore = (*TimeSeriesDB)(nil)
+
+func idsToString(ids []int32) string {
+	idStrings := make([]string, len(ids))
+	for i, id := range ids {
+		idStrings[i] = fmt.Sprintf("%d", id)
+	}
+	idsStr := strings.Join(idStrings, ",")
+	return idsStr
+}
+
+func NewTimeSeries(clickhouse *sql.DB, cache common.Cache[CacheKey, any]) *TimeSeriesDB {
+	const statsQuery = `WITH requests AS
+(
+SELECT
+toDateTime({{.TimeFuncRequests}}) AS agg_time,
+sum(count) AS count
+FROM {{.RequestsTable}} FINAL
+WHERE org_id = {org_id:UInt32} AND property_id = {property_id:UInt32} AND timestamp >= {timestamp:DateTime}
+GROUP BY agg_time
+ORDER BY agg_time
+),
+verifies AS (
+SELECT
+toDateTime({{.TimeFuncVerifies}}) AS agg_time,
+sum(success_count) AS count
+FROM {{.VerifiesTable}} FINAL
+WHERE org_id = {org_id:UInt32} AND property_id = {property_id:UInt32} AND timestamp >= {timestamp:DateTime}
+GROUP BY agg_time
+ORDER BY agg_time
+)
+SELECT
+agg_time,
+sum(requests_count) AS requests_count,
+sum(verifies_count) AS verifies_count
+FROM
+(
+SELECT agg_time, count AS requests_count, toUInt64(0) AS verifies_count FROM requests
+UNION ALL
+SELECT agg_time, toUInt64(0) AS requests_count, count AS verifies_count FROM verifies
+)
+GROUP BY agg_time
+ORDER BY agg_time WITH FILL FROM toDateTime({{.FillFrom}}) TO now() STEP {{.Interval}}
+SETTINGS use_query_cache = true, query_cache_nondeterministic_function_handling = 'save', query_cache_tag = 'property_stats_period'`
+
+	return &TimeSeriesDB{
+		statsQueryTemplate: template.Must(template.New("stats").Parse(statsQuery)),
+		Clickhouse:         clickhouse,
+		Cache:              cache,
+	}
+}
+
+func (ts *TimeSeriesDB) UpdateConfig(maintenanceMode bool) {
+	ts.maintenanceMode.Store(maintenanceMode)
+}
+
+func (ts *TimeSeriesDB) Ping(ctx context.Context) error {
+	if ts.Clickhouse == nil {
+		return ErrClickHouseNotConfigured
+	}
+	rows, err := ts.Clickhouse.Query("SELECT 1")
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute ping query", common.ErrAttr(err))
+		return err
+	}
+
+	defer rows.Close()
+
+	if rows.Next() {
+		var v int32
+		if err := rows.Scan(&v); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from ping query", common.ErrAttr(err))
+			return err
+		}
+
+		slog.Log(ctx, common.LevelTrace, "Pinged ClickHouse", "result", v)
+	}
+
+	return nil
+}
+
+func (ts *TimeSeriesDB) DropCache(ctx context.Context, tag string) error {
+	if len(tag) == 0 {
+		return ErrInvalidInput
+	}
+
+	_, err := ts.Clickhouse.Exec(fmt.Sprintf("SYSTEM DROP QUERY CACHE TAG '%s'", tag))
+	return err
+}
+
+func (ts *TimeSeriesDB) IsAvailable() bool {
+	return !ts.maintenanceMode.Load()
+}
+
+func (ts *TimeSeriesDB) WriteAccessLogBatch(ctx context.Context, records []*common.AccessRecord) error {
+	if len(records) == 0 {
+		slog.WarnContext(ctx, "Attempt to insert empty access log batch")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	scope, err := ts.Clickhouse.Begin()
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to begin batch insert", common.ErrAttr(err))
+		return err
+	}
+
+	var committed bool
+	defer func() {
+		if !committed {
+			if rerr := scope.Rollback(); rerr != nil {
+				slog.ErrorContext(ctx, "Failed to rollback transaction", common.ErrAttr(rerr))
+			}
+		}
+	}()
+
+	insertCtx := clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"async_insert":          1,
+		"wait_for_async_insert": 1,
+	}))
+	batch, err := scope.PrepareContext(insertCtx,
+		fmt.Sprintf(
+			"INSERT INTO %s (user_id, org_id, property_id, fingerprint, timestamp, rule_id, puzzle_id, expires_at, ip_family, ip_prefix, browser, browser_major, os, device)",
+			AccessLogTableName,
+		),
+	)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to prepare insert query", common.ErrAttr(err))
+		return err
+	}
+
+	for i, r := range records {
+		expiresAt := r.ExpiresAt
+		if expiresAt.IsZero() {
+			expiresAt = time.Unix(0, 0)
+		}
+		_, err = batch.Exec(r.UserID, r.OrgID, r.PropertyID, r.Fingerprint, r.Timestamp.UTC(), r.RuleID,
+			r.PuzzleID, expiresAt.UTC(), r.IPFamily, r.IPPrefix, r.Browser, r.BrowserMajor, r.OS, r.Device)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to exec insert for record", common.ErrAttr(err), "index", i)
+			return err
+		}
+	}
+
+	err = scope.Commit()
+	if err == nil {
+		committed = true
+		slog.InfoContext(ctx, "Inserted batch of access records", "size", len(records))
+	} else {
+		slog.ErrorContext(ctx, "Failed to insert access log batch", common.ErrAttr(err))
+	}
+
+	return err
+}
+
+func (ts *TimeSeriesDB) WriteVerifyLogBatch(ctx context.Context, records []*common.VerifyRecord) error {
+	if len(records) == 0 {
+		slog.WarnContext(ctx, "Attempt to insert empty verify batch")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	scope, err := ts.Clickhouse.Begin()
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to begin batch insert", common.ErrAttr(err))
+		return err
+	}
+	var committed bool
+	defer func() {
+		if !committed {
+			if rerr := scope.Rollback(); rerr != nil {
+				slog.ErrorContext(ctx, "Failed to rollback transaction", common.ErrAttr(rerr))
+			}
+		}
+	}()
+
+	insertCtx := clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"async_insert":          1,
+		"wait_for_async_insert": 1,
+	}))
+	batch, err := scope.PrepareContext(insertCtx, fmt.Sprintf("INSERT INTO %s (user_id, org_id, property_id, puzzle_id, status, timestamp, expires_at, user_agent)", VerifyLogTableName))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to prepare insert query", common.ErrAttr(err))
+		return err
+	}
+
+	for i, r := range records {
+		expiresAt := r.ExpiresAt
+		if expiresAt.IsZero() {
+			expiresAt = time.Unix(0, 0)
+		}
+		verifyClient := common.VerifyClientFromUserAgent(r.UserAgent)
+		_, err = batch.Exec(r.UserID, r.OrgID, r.PropertyID, r.PuzzleID, r.Status, r.Timestamp.UTC(), expiresAt.UTC(), string(verifyClient))
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to exec insert for record", common.ErrAttr(err), "index", i)
+			return err
+		}
+	}
+
+	err = scope.Commit()
+	if err == nil {
+		committed = true
+		slog.InfoContext(ctx, "Inserted batch of verify records", "size", len(records))
+	} else {
+		slog.ErrorContext(ctx, "Failed to insert verify log batch", common.ErrAttr(err))
+	}
+
+	return err
+}
+
+func (ts *TimeSeriesDB) WriteFormSubmitBatch(ctx context.Context, records []*common.FormSubmitRecord) error {
+	if len(records) == 0 {
+		slog.WarnContext(ctx, "Attempt to insert empty form submit batch")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	scope, err := ts.Clickhouse.Begin()
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to begin batch insert", common.ErrAttr(err))
+		return err
+	}
+	var committed bool
+	defer func() {
+		if !committed {
+			if rerr := scope.Rollback(); rerr != nil {
+				slog.ErrorContext(ctx, "Failed to rollback transaction", common.ErrAttr(rerr))
+			}
+		}
+	}()
+
+	batch, err := scope.Prepare(fmt.Sprintf("INSERT INTO %s SETTINGS async_insert = 1, wait_for_async_insert = 1", FormSubmitLogTableName))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to prepare insert query", common.ErrAttr(err))
+		return err
+	}
+
+	for i, r := range records {
+		_, err = batch.Exec(r.UserID, r.OrgID, r.FormID, r.Status, r.Timestamp.UTC())
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to exec insert for record", common.ErrAttr(err), "index", i)
+			return err
+		}
+	}
+
+	err = scope.Commit()
+	if err == nil {
+		committed = true
+		slog.InfoContext(ctx, "Inserted batch of form submit records", "size", len(records))
+	} else {
+		slog.ErrorContext(ctx, "Failed to insert form submit log batch", common.ErrAttr(err))
+	}
+
+	return err
+}
+
+func (ts *TimeSeriesDB) RetrievePropertyStatsSince(ctx context.Context, r *common.BackfillRequest, from time.Time) ([]*common.TimeCount, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	query := `SELECT timestamp, sum(count) as count
+FROM %s FINAL
+WHERE user_id = {user_id:UInt32} AND org_id = {org_id:UInt32} AND property_id = {property_id:UInt32} AND timestamp >= {timestamp:DateTime}
+GROUP BY timestamp
+ORDER BY timestamp`
+	rows, err := ts.Clickhouse.Query(fmt.Sprintf(query, AccessLogTableName5m),
+		clickhouse.Named("user_id", strconv.Itoa(int(r.UserID))),
+		clickhouse.Named("org_id", strconv.Itoa(int(r.OrgID))),
+		clickhouse.Named("property_id", strconv.Itoa(int(r.PropertyID))),
+		clickhouse.DateNamed("timestamp", from, clickhouse.Seconds))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute property stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	results := make([]*common.TimeCount, 0)
+
+	for rows.Next() {
+		bc := &common.TimeCount{}
+		if err := rows.Scan(&bc.Timestamp, &bc.Count); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from property stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		results = append(results, bc)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in property stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.DebugContext(ctx, "Read property stats", "count", len(results), "from", from)
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveAccountStats(ctx context.Context, userID int32, from time.Time) ([]*common.OrgTimeCount, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	fromStr := from.Format(time.DateTime)
+
+	cacheKey := userAccountStatsCacheKey(userID, fromStr)
+	if stats, err := FetchCachedArray[common.OrgTimeCount](ctx, ts.Cache, cacheKey); (err == nil) && (len(stats) > 0) {
+		slog.DebugContext(ctx, "User account stats were cached", "userID", userID, "key", cacheKey, "count", len(stats))
+		return stats, nil
+	}
+
+	results, err := ts.retrieveAccountStats(ctx, userID, fromStr, "toStartOfMonth")
+	if err != nil {
+		return nil, err
+	}
+
+	_ = ts.Cache.Set(ctx, cacheKey, results)
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveAccountStatsByPeriod(ctx context.Context, userID int32, from time.Time, period common.TimePeriod) ([]*common.OrgTimeCount, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	var timeFunction string
+	switch period {
+	case common.TimePeriodToday:
+		timeFunction = "toStartOfHour"
+	case common.TimePeriodWeek, common.TimePeriodMonth:
+		timeFunction = "toStartOfDay"
+	case common.TimePeriodYear:
+		timeFunction = "toStartOfMonth"
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	return ts.retrieveAccountStats(ctx, userID, from.Format(time.DateTime), timeFunction)
+}
+
+func (ts *TimeSeriesDB) retrieveAccountStats(ctx context.Context, userID int32, fromStr, timeFunction string) ([]*common.OrgTimeCount, error) {
+	query := `SELECT org_id, ts, max(count) as count
+FROM (
+    SELECT org_id, %[1]s(timestamp) as ts, sum(count) as count
+    FROM %[2]s
+    WHERE user_id = {user_id:UInt32} AND timestamp >= {timestamp:DateTime}
+    GROUP BY org_id, %[1]s(timestamp)
+    UNION ALL
+    SELECT org_id, %[1]s(timestamp) as ts, sum(success_count + failure_count) as count
+    FROM %[3]s
+    WHERE user_id = {user_id:UInt32} AND timestamp >= {timestamp:DateTime}
+    GROUP BY org_id, %[1]s(timestamp)
+)
+GROUP BY org_id, ts
+ORDER BY org_id, ts`
+	rows, err := ts.Clickhouse.Query(fmt.Sprintf(query, timeFunction, AccessLogTableName1d, VerifyLogTable1d),
+		clickhouse.Named("user_id", strconv.Itoa(int(userID))),
+		clickhouse.Named("timestamp", fromStr))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute account stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	results := make([]*common.OrgTimeCount, 0)
+
+	for rows.Next() {
+		bc := &common.OrgTimeCount{}
+		if err := rows.Scan(&bc.OrgID, &bc.Timestamp, &bc.Count); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from account stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		results = append(results, bc)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in account stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	return results, nil
+}
+
+func requestedAccountReportStats(userIDs []int32) (map[int32]*common.UserReportAccountStats, []uint32, error) {
+	stats := make(map[int32]*common.UserReportAccountStats, len(userIDs))
+	ids := make([]uint32, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			return nil, nil, ErrInvalidInput
+		}
+		if _, ok := stats[userID]; ok {
+			continue
+		}
+		stats[userID] = &common.UserReportAccountStats{}
+		ids = append(ids, uint32(userID))
+	}
+	return stats, ids, nil
+}
+
+func (ts *TimeSeriesDB) retrieveAccountReportStats(ctx context.Context, userIDs []int32, from, mid, to time.Time, requestTable string) (map[int32]*common.UserReportAccountStats, error) {
+	stats, ids, err := requestedAccountReportStats(userIDs)
+	if err != nil || len(ids) == 0 {
+		return stats, err
+	}
+
+	query := `SELECT
+    user_id,
+    sum(current_requests) AS current_requests,
+    sum(previous_requests) AS previous_requests,
+    sum(current_verifications) AS current_verifications,
+    sum(previous_verifications) AS previous_verifications
+FROM
+(
+    SELECT
+        user_id,
+        sumIf(count, timestamp >= {mid_ts:DateTime}) AS current_requests,
+        sumIf(count, timestamp < {mid_ts:DateTime}) AS previous_requests,
+        toUInt64(0) AS current_verifications,
+        toUInt64(0) AS previous_verifications
+    FROM %s
+    WHERE user_id IN {user_ids:Array(UInt32)}
+      AND timestamp >= {from_ts:DateTime}
+      AND timestamp < {to_ts:DateTime}
+    GROUP BY user_id
+
+    UNION ALL
+
+    SELECT
+        user_id,
+        toUInt64(0) AS current_requests,
+        toUInt64(0) AS previous_requests,
+        sumIf(success_count + failure_count, timestamp >= {mid_ts:DateTime}) AS current_verifications,
+        sumIf(success_count + failure_count, timestamp < {mid_ts:DateTime}) AS previous_verifications
+    FROM %s
+    WHERE user_id IN {user_ids:Array(UInt32)}
+      AND timestamp >= {from_ts:DateTime}
+      AND timestamp < {to_ts:DateTime}
+    GROUP BY user_id
+)
+GROUP BY user_id
+ORDER BY user_id`
+
+	rows, err := ts.Clickhouse.QueryContext(ctx, fmt.Sprintf(query, requestTable, VerifyLogTable1d),
+		clickhouse.Named("user_ids", ids),
+		clickhouse.DateNamed("from_ts", from, clickhouse.Seconds),
+		clickhouse.DateNamed("mid_ts", mid, clickhouse.Seconds),
+		clickhouse.DateNamed("to_ts", to, clickhouse.Seconds))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute account report stats query", "users", len(ids), "requestTable", requestTable, common.ErrAttr(err))
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var userID int32
+		stat := &common.UserReportAccountStats{}
+		if err := rows.Scan(&userID, &stat.CurrentRequests, &stat.PrevRequests, &stat.CurrentVerifies, &stat.PrevVerifies); err != nil {
+			slog.ErrorContext(ctx, "Failed to read account report stats row", common.ErrAttr(err))
+			return nil, err
+		}
+		if _, ok := stats[userID]; ok {
+			stats[userID] = stat
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in account report stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched account report stats", "users", len(stats), "requestTable", requestTable)
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveWeeklyAccountReportStats(ctx context.Context, userIDs []int32, from, mid, to time.Time) (map[int32]*common.UserReportAccountStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+	return ts.retrieveAccountReportStats(ctx, userIDs, from, mid, to, AccessLogTableName1d)
+}
+
+func isMonthStart(t time.Time) bool {
+	return t.Day() == 1 && t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0
+}
+
+func consecutiveUTCMonthStarts(from, mid, to time.Time) bool {
+	if from.Location() != time.UTC || mid.Location() != time.UTC || to.Location() != time.UTC {
+		return false
+	}
+	return isMonthStart(from) && isMonthStart(mid) && isMonthStart(to) &&
+		mid.Equal(from.AddDate(0, 1, 0)) && to.Equal(mid.AddDate(0, 1, 0))
+}
+
+func useMonthlyRequestTable(from, mid, to, now time.Time) bool {
+	return consecutiveUTCMonthStarts(from, mid, to) && from.AddDate(1, 0, 0).After(now.UTC())
+}
+
+func (ts *TimeSeriesDB) RetrieveMonthlyAccountReportStats(ctx context.Context, userIDs []int32, from, mid, to time.Time) (map[int32]*common.UserReportAccountStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+	requestTable := AccessLogTableName1d
+	if useMonthlyRequestTable(from, mid, to, time.Now()) {
+		requestTable = AccessLogTableName1mo
+	}
+	return ts.retrieveAccountReportStats(ctx, userIDs, from, mid, to, requestTable)
+}
+
+func invalidUserReportOptions(options common.UserReportOptions) bool {
+	return options.TopPropertiesLimit < 0 || options.SecurityEventsLimit < 0 || options.SecurityEventsPerPropertyLimit < 0 || options.SecurityEventRatioThreshold < 0
+}
+
+func sortUserReportProperties(properties []*common.UserReportPropertyStat) {
+	sort.Slice(properties, func(i, j int) bool {
+		if properties[i].CurrentRequests != properties[j].CurrentRequests {
+			return properties[i].CurrentRequests > properties[j].CurrentRequests
+		}
+		if properties[i].PropertyID != properties[j].PropertyID {
+			return properties[i].PropertyID < properties[j].PropertyID
+		}
+		return properties[i].OrgID < properties[j].OrgID
+	})
+}
+
+func highRequestSecurityEventsLimit(securityEventsLimit int) int {
+	return min(2, securityEventsLimit/2)
+}
+
+type reportPropertyKey struct {
+	propertyID int32
+	orgID      int32
+}
+
+func reportSecurityEventQualifications(event *common.UserReportSecurityEvent, options common.UserReportOptions) (bool, bool) {
+	requestQualified := event.Requests >= options.SecurityEventMinimumDominantCount &&
+		float64(event.Requests) > float64(max(event.Verifies, 1))*options.SecurityEventRatioThreshold
+	failureQualified := event.FailedVerifies >= options.SecurityEventMinimumDominantCount &&
+		float64(event.FailedVerifies) > float64(max(event.Requests, 1))*options.SecurityEventRatioThreshold
+	return requestQualified || failureQualified, failureQualified
+}
+
+func sortReportSecurityEventsByRequests(events []*common.UserReportSecurityEvent) {
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Requests != events[j].Requests {
+			return events[i].Requests > events[j].Requests
+		}
+		if events[i].PropertyID != events[j].PropertyID {
+			return events[i].PropertyID < events[j].PropertyID
+		}
+		if events[i].OrgID != events[j].OrgID {
+			return events[i].OrgID < events[j].OrgID
+		}
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+}
+
+func limitReportSecurityEventsByProperty(events []*common.UserReportSecurityEvent, limit, perPropertyLimit int) []*common.UserReportSecurityEvent {
+	if limit <= 0 || perPropertyLimit <= 0 {
+		return nil
+	}
+	sortReportSecurityEventsByRequests(events)
+	propertyCounts := make(map[reportPropertyKey]int)
+	selected := make([]*common.UserReportSecurityEvent, 0, min(limit, len(events)))
+	for _, event := range events {
+		key := reportPropertyKey{propertyID: event.PropertyID, orgID: event.OrgID}
+		if propertyCounts[key] >= perPropertyLimit {
+			continue
+		}
+		selected = append(selected, event)
+		propertyCounts[key]++
+		if len(selected) == limit {
+			return selected
+		}
+	}
+	return selected
+}
+
+func (ts *TimeSeriesDB) retrieveReportStats(
+	ctx context.Context,
+	userID int32,
+	from, mid, to time.Time,
+	accessTable, verifyTable string,
+	options common.UserReportOptions,
+) (*common.UserReportStats, error) {
+	if userID <= 0 || invalidUserReportOptions(options) {
+		return nil, ErrInvalidInput
+	}
+
+	query := `WITH daily_activity AS
+(
+    SELECT
+        property_id,
+        org_id,
+        timestamp,
+        sum(requests) AS requests,
+        sum(verifications) AS verifications,
+        sum(failed_verifications) AS failed_verifications
+    FROM
+    (
+        SELECT
+            property_id,
+            org_id,
+            toStartOfDay(timestamp) AS timestamp,
+            sum(count) AS requests,
+            toUInt64(0) AS verifications,
+            toUInt64(0) AS failed_verifications
+        FROM %s
+        WHERE user_id = {user_id:UInt32}
+          AND timestamp >= {mid_ts:DateTime}
+          AND timestamp < {to_ts:DateTime}
+        GROUP BY property_id, org_id, timestamp
+
+        UNION ALL
+
+        SELECT
+            property_id,
+            org_id,
+            toStartOfDay(timestamp) AS timestamp,
+            toUInt64(0) AS requests,
+            sum(success_count + failure_count) AS verifications,
+            sum(failure_count) AS failed_verifications
+        FROM %s
+        WHERE user_id = {user_id:UInt32}
+          AND timestamp >= {mid_ts:DateTime}
+          AND timestamp < {to_ts:DateTime}
+        GROUP BY property_id, org_id, timestamp
+    )
+    GROUP BY property_id, org_id, timestamp
+),
+candidate_activity AS
+(
+    SELECT
+        property_id,
+        org_id,
+        timestamp,
+        requests,
+        verifications,
+        failed_verifications,
+        toUInt8(requests >= {minimum_dominant_count:UInt64}
+            AND toFloat64(requests) > greatest(toFloat64(verifications), 1.0) * {ratio_threshold:Float64}) AS request_qualified,
+        toUInt8(failed_verifications >= {minimum_dominant_count:UInt64}
+            AND toFloat64(failed_verifications) > greatest(toFloat64(requests), 1.0) * {ratio_threshold:Float64}) AS failure_qualified
+    FROM daily_activity
+),
+candidate_pool AS
+(
+    SELECT *
+    FROM candidate_activity
+    WHERE request_qualified > 0 OR failure_qualified > 0 OR requests > 0
+    ORDER BY requests DESC, property_id, org_id, timestamp
+    LIMIT {security_events_per_property_limit:UInt64} BY
+        property_id, org_id, request_qualified OR failure_qualified
+)
+SELECT
+    toUInt8(1) AS row_type,
+    property_id,
+    org_id,
+    current_requests,
+    previous_requests,
+    toDateTime(0) AS timestamp,
+    toUInt64(0) AS verifications,
+    toUInt64(0) AS failed_verifications,
+    toUInt8(0) AS failure_qualified
+FROM
+(
+    SELECT
+        property_id,
+        org_id,
+        sumIf(count, timestamp >= {mid_ts:DateTime}) AS current_requests,
+        sumIf(count, timestamp < {mid_ts:DateTime}) AS previous_requests
+    FROM %s
+    WHERE user_id = {user_id:UInt32}
+      AND timestamp >= {from_ts:DateTime}
+      AND timestamp < {to_ts:DateTime}
+    GROUP BY property_id, org_id
+    HAVING current_requests > 0
+    ORDER BY current_requests DESC, property_id, org_id
+    LIMIT {top_properties_limit:UInt64}
+)
+
+UNION ALL
+
+SELECT
+    if(request_qualified > 0 OR failure_qualified > 0, toUInt8(2), toUInt8(3)) AS row_type,
+    property_id,
+    org_id,
+    requests AS current_requests,
+    toUInt64(0) AS previous_requests,
+    timestamp,
+    verifications,
+    failed_verifications,
+    failure_qualified
+FROM
+(
+    SELECT *
+    FROM candidate_pool
+    ORDER BY requests DESC, property_id, org_id, timestamp
+    LIMIT {security_events_limit:UInt64} BY request_qualified OR failure_qualified
+)`
+
+	rows, err := ts.Clickhouse.QueryContext(ctx, fmt.Sprintf(query, accessTable, verifyTable, accessTable),
+		clickhouse.Named("user_id", uint32(userID)),
+		clickhouse.DateNamed("from_ts", from, clickhouse.Seconds),
+		clickhouse.DateNamed("mid_ts", mid, clickhouse.Seconds),
+		clickhouse.DateNamed("to_ts", to, clickhouse.Seconds),
+		clickhouse.Named("top_properties_limit", uint64(options.TopPropertiesLimit)),
+		clickhouse.Named("security_events_limit", uint64(options.SecurityEventsLimit)),
+		clickhouse.Named("security_events_per_property_limit", uint64(options.SecurityEventsPerPropertyLimit)),
+		clickhouse.Named("ratio_threshold", options.SecurityEventRatioThreshold),
+		clickhouse.Named("minimum_dominant_count", options.SecurityEventMinimumDominantCount))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute report stats query", "userID", userID, "accessTable", accessTable, common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	stats := &common.UserReportStats{}
+	highRequestCandidates := make([]*common.UserReportSecurityEvent, 0, options.SecurityEventsLimit)
+
+	for rows.Next() {
+		var rowType uint8
+		var propertyID, orgID int32
+		var currentRequests, previousRequests, verifications, failedVerifications uint64
+		var failureQualified uint8
+		var timestamp time.Time
+		if err := rows.Scan(&rowType, &propertyID, &orgID, &currentRequests, &previousRequests, &timestamp, &verifications, &failedVerifications, &failureQualified); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from report stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		switch rowType {
+		case 1:
+			stats.Properties = append(stats.Properties, &common.UserReportPropertyStat{
+				PropertyID:      propertyID,
+				OrgID:           orgID,
+				CurrentRequests: currentRequests,
+				PrevRequests:    previousRequests,
+			})
+		case 2, 3:
+			candidate := &common.UserReportSecurityEvent{
+				PropertyID:       propertyID,
+				OrgID:            orgID,
+				Timestamp:        timestamp,
+				Requests:         currentRequests,
+				Verifies:         verifications,
+				FailedVerifies:   failedVerifications,
+				FailureQualified: failureQualified != 0,
+			}
+			if rowType == 2 {
+				stats.SecurityEvents = append(stats.SecurityEvents, candidate)
+			} else {
+				highRequestCandidates = append(highRequestCandidates, candidate)
+			}
+		default:
+			return nil, fmt.Errorf("unknown report stats row type %d", rowType)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in report stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	sortReportSecurityEventsByRequests(highRequestCandidates)
+	highRequestEventsLimit := min(highRequestSecurityEventsLimit(options.SecurityEventsLimit), len(highRequestCandidates))
+	stats.SecurityEvents = append(stats.SecurityEvents, highRequestCandidates[:highRequestEventsLimit]...)
+	sortUserReportProperties(stats.Properties)
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveWeeklyPropertiesReportStats(ctx context.Context, userID int32, from, mid, to time.Time, options common.UserReportOptions) (*common.UserReportStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	stats, err := ts.retrieveReportStats(ctx, userID, from, mid, to, AccessLogTableName1d, VerifyLogTable1d, options)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched weekly report stats", "userID", userID, "properties", len(stats.Properties), "protectionCandidates", len(stats.SecurityEvents))
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveMonthlyPropertiesReportStats(ctx context.Context, userID int32, from, mid, to time.Time, options common.UserReportOptions) (*common.UserReportStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	stats, err := ts.retrieveReportStats(ctx, userID, from, mid, to, AccessLogTableName1d, VerifyLogTable1d, options)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched monthly report stats", "userID", userID, "properties", len(stats.Properties), "protectionCandidates", len(stats.SecurityEvents))
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) retrieveFormsReportStats(ctx context.Context, userID int32, from, mid, to time.Time, table string) (*common.UserFormsReportStats, error) {
+	fromStr := from.Format(time.DateTime)
+	midStr := mid.Format(time.DateTime)
+	toStr := to.Format(time.DateTime)
+	userIDStr := strconv.Itoa(int(userID))
+
+	query := `SELECT form_id, org_id,
+    sumIf(success_count + failure_count, timestamp >= {mid_ts:DateTime}) as current_submissions,
+    sumIf(success_count + failure_count, timestamp < {mid_ts:DateTime}) as prev_submissions,
+    sumIf(failure_count, timestamp >= {mid_ts:DateTime}) as current_errors,
+    sumIf(failure_count, timestamp < {mid_ts:DateTime}) as prev_errors
+FROM %s FINAL
+WHERE user_id = {user_id:UInt32} AND timestamp >= {from_ts:DateTime} AND timestamp < {to_ts:DateTime}
+GROUP BY form_id, org_id
+ORDER BY current_submissions DESC`
+
+	rows, err := ts.Clickhouse.Query(fmt.Sprintf(query, table),
+		clickhouse.Named("user_id", userIDStr),
+		clickhouse.Named("from_ts", fromStr),
+		clickhouse.Named("mid_ts", midStr),
+		clickhouse.Named("to_ts", toStr))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute forms report stats query", "userID", userID, "table", table, common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	stats := &common.UserFormsReportStats{}
+
+	for rows.Next() {
+		fs := &common.UserReportFormStat{}
+		if err := rows.Scan(&fs.FormID, &fs.OrgID, &fs.CurrentSubmissions, &fs.PrevSubmissions, &fs.CurrentErrors, &fs.PrevErrors); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from forms report stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		stats.Forms = append(stats.Forms, fs)
+		stats.TotalCurrentSubmissions += fs.CurrentSubmissions
+		stats.TotalPrevSubmissions += fs.PrevSubmissions
+		stats.TotalCurrentErrors += fs.CurrentErrors
+		stats.TotalPrevErrors += fs.PrevErrors
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in form reports query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveWeeklyFormsReportStats(ctx context.Context, userID int32, from, mid, to time.Time) (*common.UserFormsReportStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	stats, err := ts.retrieveFormsReportStats(ctx, userID, from, mid, to, FormSubmitLogTableName1d)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched weekly forms report stats", "userID", userID, "forms", len(stats.Forms),
+		"currentSubmissions", stats.TotalCurrentSubmissions, "prevSubmissions", stats.TotalPrevSubmissions,
+		"currentErrors", stats.TotalCurrentErrors, "prevErrors", stats.TotalPrevErrors)
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveMonthlyFormsReportStats(ctx context.Context, userID int32, from, mid, to time.Time) (*common.UserFormsReportStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	stats, err := ts.retrieveFormsReportStats(ctx, userID, from, mid, to, FormSubmitLogTableName1d)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched monthly forms report stats", "userID", userID, "forms", len(stats.Forms),
+		"currentSubmissions", stats.TotalCurrentSubmissions, "prevSubmissions", stats.TotalPrevSubmissions,
+		"currentErrors", stats.TotalCurrentErrors, "prevErrors", stats.TotalPrevErrors)
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveOrgStatsByPeriod(ctx context.Context, orgID int32, period common.TimePeriod, topPropertiesLimit int) (*common.OrgTimePeriodStats, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+	if topPropertiesLimit <= 0 {
+		return nil, ErrInvalidInput
+	}
+
+	tnow := time.Now().UTC()
+	var timeFrom time.Time
+	var requestsTable string
+	var verificationsTable string
+	var timeFunction string
+	var cacheKey *CacheKey
+
+	switch period {
+	case common.TimePeriodToday:
+		timeFrom = tnow.AddDate(0, 0, -1).Truncate(time.Hour)
+		requestsTable = AccessLogTableName1h
+		verificationsTable = VerifyLogTable1h
+		timeFunction = "toStartOfHour(%s)"
+		cacheKey = new(CacheKey)
+		*cacheKey = orgStatsCacheKey(orgID, fmt.Sprintf("%s/%d", timeFrom.Format(time.DateTime), topPropertiesLimit))
+	case common.TimePeriodWeek:
+		timeFrom = tnow.AddDate(0, 0, -7).Truncate(6 * time.Hour)
+		requestsTable = AccessLogTableName1d
+		verificationsTable = VerifyLogTable1d
+		timeFunction = "toStartOfInterval(%s, INTERVAL 6 HOUR)"
+	case common.TimePeriodMonth:
+		timeFrom = tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour)
+		requestsTable = AccessLogTableName1d
+		verificationsTable = VerifyLogTable1d
+		timeFunction = "toStartOfDay(%s)"
+	case common.TimePeriodYear:
+		timeFrom = tnow.AddDate(-1, 0, 0).Truncate(24 * time.Hour)
+		requestsTable = AccessLogTableName1d
+		verificationsTable = VerifyLogTable1d
+		timeFunction = "toStartOfMonth(%s)"
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	if cacheKey != nil {
+		if stats, err := FetchCachedOne[common.OrgTimePeriodStats](ctx, ts.Cache, *cacheKey); err == nil && len(stats.PropertyIDs) > 0 {
+			slog.DebugContext(ctx, "Organization stats were cached", "orgID", orgID, "key", *cacheKey, "series", len(stats.PropertyIDs), "points", len(stats.Points))
+			return stats, nil
+		}
+	}
+
+	query := fmt.Sprintf(`WITH property_volume AS
+(
+    SELECT property_id, sum(volume) AS volume
+    FROM
+    (
+        SELECT property_id, sum(count) AS volume
+        FROM %s FINAL
+        WHERE org_id = {org_id:UInt32} AND timestamp >= {timestamp:DateTime}
+        GROUP BY property_id
+
+        UNION ALL
+
+        SELECT property_id, sum(success_count + failure_count) AS volume
+        FROM %s FINAL
+        WHERE org_id = {org_id:UInt32} AND timestamp >= {timestamp:DateTime}
+        GROUP BY property_id
+    )
+    GROUP BY property_id
+),
+top_properties AS
+(
+    SELECT
+        property_id,
+        row_number() OVER (ORDER BY volume DESC, property_id ASC) AS series_rank
+    FROM property_volume
+    WHERE volume > 0
+    QUALIFY series_rank <= {top_properties_limit:UInt32}
+),
+request_points AS
+(
+    SELECT
+        if(property_id IN (SELECT property_id FROM top_properties), toInt64(property_id), toInt64(-1)) AS grouped_property_id,
+        toDateTime(%s) AS agg_time,
+        sum(count) AS requests_count
+    FROM %s FINAL
+    WHERE org_id = {org_id:UInt32} AND timestamp >= {timestamp:DateTime}
+    GROUP BY grouped_property_id, agg_time
+)
+SELECT row_type, property_id, series_rank, agg_time, requests_count
+FROM
+(
+    SELECT
+        toUInt8(1) AS row_type,
+        toInt64(property_id) AS property_id,
+        toUInt64(series_rank) AS series_rank,
+        toDateTime(0) AS agg_time,
+        toUInt64(0) AS requests_count
+    FROM top_properties
+
+    UNION ALL
+
+    SELECT
+        toUInt8(1) AS row_type,
+        toInt64(-1) AS property_id,
+        toUInt64({top_properties_limit:UInt32} + 1) AS series_rank,
+        toDateTime(0) AS agg_time,
+        toUInt64(0) AS requests_count
+    FROM
+    (
+        SELECT count() AS property_count
+        FROM property_volume
+        WHERE volume > 0
+    )
+    WHERE property_count > {top_properties_limit:UInt32}
+
+    UNION ALL
+
+    SELECT
+        toUInt8(2) AS row_type,
+        grouped_property_id AS property_id,
+        toUInt64(0) AS series_rank,
+        agg_time,
+        requests_count
+    FROM request_points
+)
+ORDER BY row_type, series_rank, property_id, agg_time
+SETTINGS use_query_cache = true, query_cache_nondeterministic_function_handling = 'save', query_cache_tag = 'org_stats_period'`,
+		requestsTable,
+		verificationsTable,
+		fmt.Sprintf(timeFunction, "timestamp"),
+		requestsTable)
+
+	rows, err := ts.Clickhouse.Query(query,
+		clickhouse.Named("org_id", strconv.Itoa(int(orgID))),
+		clickhouse.Named("timestamp", timeFrom.Format(time.DateTime)),
+		clickhouse.Named("top_properties_limit", uint32(topPropertiesLimit)))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to query organization stats", common.ErrAttr(err))
+		return nil, err
+	}
+	defer rows.Close()
+
+	stats := &common.OrgTimePeriodStats{
+		PropertyIDs: make([]int32, 0, topPropertiesLimit+1),
+		Points:      make([]*common.OrgPropertyTimePeriodStat, 0),
+	}
+	for rows.Next() {
+		var rowType uint8
+		var propertyID int32
+		var seriesRank uint64
+		var timestamp time.Time
+		var requestsCount int
+		if err := rows.Scan(&rowType, &propertyID, &seriesRank, &timestamp, &requestsCount); err != nil {
+			slog.ErrorContext(ctx, "Failed to read organization stats row", common.ErrAttr(err))
+			return nil, err
+		}
+
+		switch rowType {
+		case 1:
+			stats.PropertyIDs = append(stats.PropertyIDs, propertyID)
+		case 2:
+			stats.Points = append(stats.Points, &common.OrgPropertyTimePeriodStat{
+				PropertyID: propertyID, Timestamp: timestamp, RequestsCount: requestsCount,
+			})
+		default:
+			return nil, fmt.Errorf("unknown organization stats row type %d", rowType)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in organization stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched organization stats", "series", len(stats.PropertyIDs), "points", len(stats.Points), "orgID", orgID, "from", timeFrom, "period", period)
+
+	if cacheKey != nil {
+		const orgStatsCacheTTL = 5 * time.Minute
+		_ = ts.Cache.SetEx(ctx, *cacheKey, stats, orgStatsCacheTTL, statsRefresh)
+	}
+
+	return stats, nil
+}
+
+func (ts *TimeSeriesDB) RetrievePropertyStatsByPeriod(ctx context.Context, orgID, propertyID int32, period common.TimePeriod) ([]*common.TimePeriodStat, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	tnow := time.Now().UTC()
+	var timeFrom time.Time
+	var requestsTable string
+	var verificationsTable string
+	var timeFunction string
+	var interval string
+	var cacheKey *CacheKey
+
+	switch period {
+	case common.TimePeriodToday:
+		timeFrom = tnow.AddDate(0, 0, -1).Truncate(1 * time.Hour)
+		requestsTable = "request_logs_1h"
+		verificationsTable = "verify_logs_1h"
+		timeFunction = "toStartOfHour(%s)"
+		interval = "INTERVAL 1 HOUR"
+		// in server we only cache the "today" as this is the default chart in the UI
+		cacheKey = new(CacheKey)
+		*cacheKey = propertyStatsCacheKey(propertyID, timeFrom.Format(time.DateTime))
+	case common.TimePeriodWeek:
+		timeFrom = tnow.AddDate(0, 0, -7).Truncate(6 * time.Hour)
+		requestsTable = "request_logs_1d"
+		verificationsTable = "verify_logs_1d"
+		timeFunction = "toStartOfInterval(%s, INTERVAL 6 HOUR)"
+		interval = "INTERVAL 6 HOUR"
+	case common.TimePeriodMonth:
+		timeFrom = tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour)
+		requestsTable = "request_logs_1d"
+		verificationsTable = "verify_logs_1d"
+		timeFunction = "toStartOfDay(%s)"
+		interval = "INTERVAL 1 DAY"
+	case common.TimePeriodYear:
+		timeFrom = tnow.AddDate(-1, 0, 0).Truncate(24 * time.Hour)
+		requestsTable = "request_logs_1d"
+		verificationsTable = "verify_logs_1d"
+		timeFunction = "toStartOfMonth(%s)"
+		interval = "INTERVAL 1 MONTH"
+	}
+
+	if cacheKey != nil {
+		if stats, err := FetchCachedArray[common.TimePeriodStat](ctx, ts.Cache, *cacheKey); (err == nil) && (len(stats) > 0) {
+			slog.DebugContext(ctx, "Property stats were cached", "orgID", orgID, "propertyID", propertyID, "key", *cacheKey, "count", len(stats))
+			return stats, nil
+		}
+	}
+
+	data := struct {
+		RequestsTable    string
+		VerifiesTable    string
+		TimeFuncRequests string
+		TimeFuncVerifies string
+		Interval         string
+		FillFrom         string
+	}{
+		RequestsTable:    "privatecaptcha." + requestsTable,
+		VerifiesTable:    "privatecaptcha." + verificationsTable,
+		TimeFuncRequests: fmt.Sprintf(timeFunction, requestsTable+".timestamp"),
+		TimeFuncVerifies: fmt.Sprintf(timeFunction, verificationsTable+".timestamp"),
+		Interval:         interval,
+		FillFrom:         fmt.Sprintf(timeFunction, "{timestamp:DateTime}"),
+	}
+
+	buf := &bytes.Buffer{}
+	if err := ts.statsQueryTemplate.Execute(buf, data); err != nil {
+		slog.ErrorContext(ctx, "Failed to execute stats query template", common.ErrAttr(err))
+		return nil, err
+	}
+	query := buf.String()
+
+	rows, err := ts.Clickhouse.Query(query,
+		clickhouse.Named("org_id", strconv.Itoa(int(orgID))),
+		clickhouse.Named("property_id", strconv.Itoa(int(propertyID))),
+		clickhouse.Named("timestamp", timeFrom.Format(time.DateTime)))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to query property stats", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	results := make([]*common.TimePeriodStat, 0)
+
+	for rows.Next() {
+		bc := &common.TimePeriodStat{}
+		if err := rows.Scan(&bc.Timestamp, &bc.RequestsCount, &bc.VerifiesCount); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from property stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		//slog.Log(ctx, common.LevelTrace, "Read property stats row", "timestamp", bc.Timestamp, "verifies", bc.VerifiesCount,
+		//	"requests", bc.RequestsCount)
+		results = append(results, bc)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in property stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched time period stats", "count", len(results), "orgID", orgID, "propID", propertyID,
+		"from", timeFrom, "period", period)
+
+	if cacheKey != nil {
+		const propertyStatsCacheTTL = 5 * time.Minute
+		// we have 5 min buffers for updates and we do NOT delete this cache item
+		_ = ts.Cache.SetEx(ctx, *cacheKey, results, propertyStatsCacheTTL, statsRefresh)
+	}
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveFormStatsByPeriod(ctx context.Context, orgID, formID int32, period common.TimePeriod) ([]*common.FormSubmitStat, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	tnow := time.Now().UTC()
+	var timeFrom time.Time
+	var table string
+	var timeFunction string
+	var interval string
+	var cacheKey *CacheKey
+
+	switch period {
+	case common.TimePeriodToday:
+		timeFrom = tnow.AddDate(0, 0, -1).Truncate(1 * time.Hour)
+		table = FormSubmitLogTableName1h
+		timeFunction = "toStartOfHour(%s)"
+		interval = "INTERVAL 1 HOUR"
+		// in server we only cache the "today" as this is the default chart in the UI
+		cacheKey = new(CacheKey)
+		*cacheKey = FormStatsCacheKey(formID, timeFrom.Format(time.DateTime))
+	case common.TimePeriodWeek:
+		timeFrom = tnow.AddDate(0, 0, -7).Truncate(24 * time.Hour)
+		table = FormSubmitLogTableName1d
+		timeFunction = "toStartOfDay(%s)"
+		interval = "INTERVAL 1 DAY"
+	case common.TimePeriodMonth:
+		timeFrom = tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour)
+		table = FormSubmitLogTableName1d
+		timeFunction = "toStartOfDay(%s)"
+		interval = "INTERVAL 1 DAY"
+	case common.TimePeriodYear:
+		timeFrom = tnow.AddDate(-1, 0, 0).Truncate(24 * time.Hour)
+		table = FormSubmitLogTableName1d
+		timeFunction = "toStartOfMonth(%s)"
+		interval = "INTERVAL 1 MONTH"
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	if cacheKey != nil {
+		if stats, err := FetchCachedArray[common.FormSubmitStat](ctx, ts.Cache, *cacheKey); (err == nil) && (len(stats) > 0) {
+			slog.DebugContext(ctx, "Form stats were cached", "orgID", orgID, "formID", formID, "key", *cacheKey, "count", len(stats))
+			return stats, nil
+		}
+	}
+
+	query := fmt.Sprintf(`SELECT
+		toDateTime(%s) AS agg_time,
+		sum(success_count) AS success_count,
+		sum(failure_count) AS failure_count
+	FROM %s FINAL
+	WHERE org_id = {org_id:UInt32} AND form_id = {form_id:UInt32} AND timestamp >= {timestamp:DateTime}
+	GROUP BY agg_time
+	ORDER BY agg_time WITH FILL FROM toDateTime(%s) TO now() STEP %s
+	SETTINGS use_query_cache = true, query_cache_nondeterministic_function_handling = 'save', query_cache_tag = 'form_stats_period';`,
+		fmt.Sprintf(timeFunction, "timestamp"),
+		table,
+		fmt.Sprintf(timeFunction, "{timestamp:DateTime}"),
+		interval)
+
+	rows, err := ts.Clickhouse.Query(query,
+		clickhouse.Named("org_id", strconv.Itoa(int(orgID))),
+		clickhouse.Named("form_id", strconv.Itoa(int(formID))),
+		clickhouse.Named("timestamp", timeFrom.Format(time.DateTime)))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to query form submit stats", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	results := make([]*common.FormSubmitStat, 0)
+	for rows.Next() {
+		stat := &common.FormSubmitStat{}
+		if err := rows.Scan(&stat.Timestamp, &stat.SuccessCount, &stat.FailureCount); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from form submit stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		results = append(results, stat)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in form stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched form submit stats", "count", len(results), "orgID", orgID, "formID", formID,
+		"from", timeFrom, "period", period)
+
+	if cacheKey != nil {
+		const formStatsCacheTTL = 5 * time.Minute
+		// we have 5 min buffers for updates and we do NOT delete this cache item
+		_ = ts.Cache.SetEx(ctx, *cacheKey, results, formStatsCacheTTL, statsRefresh)
+	}
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveFailingForms(ctx context.Context, threshold, limit int) ([]*common.FailingFormCandidate, error) {
+	if (threshold <= 0) || (limit <= 0) {
+		return nil, ErrInvalidInput
+	}
+
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	query := fmt.Sprintf(`WITH hourly AS (
+    SELECT
+        form_id,
+        timestamp,
+        sum(success_count) AS hr_success,
+        sum(failure_count) AS hr_failure
+    FROM %s FINAL
+    WHERE timestamp >= {timestamp:DateTime}
+    GROUP BY form_id, timestamp
+    HAVING (hr_success + hr_failure) > 0
+), ranked AS (
+    SELECT
+        form_id,
+        timestamp,
+        hr_success,
+        hr_failure,
+        row_number() OVER (PARTITION BY form_id ORDER BY timestamp DESC) AS rn
+    FROM hourly
+), last_records AS (
+    SELECT
+        form_id,
+        count() AS record_count,
+        sum(hr_success) AS total_success,
+        sum(hr_failure) AS total_failure,
+        countIf(hr_success = 0 AND hr_failure > 0) AS failed_record_count
+    FROM ranked
+    WHERE rn <= {threshold:UInt32}
+    GROUP BY form_id
+)
+SELECT
+    form_id,
+    total_failure AS failure_count -- Aliased back so rows.Scan works
+FROM last_records
+WHERE record_count = {threshold:UInt32}
+    AND total_success = 0
+    AND failed_record_count = {threshold:UInt32}
+ORDER BY failure_count DESC, form_id ASC
+LIMIT {limit_val:UInt32};`, FormSubmitLogTableName1h)
+
+	rows, err := ts.Clickhouse.Query(query,
+		clickhouse.Named("timestamp", time.Now().UTC().Add(-24*time.Hour).Format(time.DateTime)),
+		clickhouse.Named("threshold", strconv.Itoa(threshold)),
+		clickhouse.Named("limit_val", strconv.Itoa(limit)))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to query failing forms", common.ErrAttr(err))
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]*common.FailingFormCandidate, 0)
+	for rows.Next() {
+		candidate := &common.FailingFormCandidate{}
+		if err := rows.Scan(&candidate.FormID, &candidate.FailureCount); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from failing forms query", common.ErrAttr(err))
+			return nil, err
+		}
+		results = append(results, candidate)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in failing forms query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched failing forms", "count", len(results), "threshold", threshold, "limit", limit)
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrievePropertyRuleStatsByPeriod(ctx context.Context, userID, orgID, propertyID int32, period common.TimePeriod) ([]*common.TimeCount, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	// Only support week and month periods for rule stats
+	if period != common.TimePeriodWeek && period != common.TimePeriodMonth {
+		return nil, ErrUnsupportedPeriod
+	}
+
+	tnow := time.Now().UTC()
+	var timeFrom time.Time
+	var timeFunction string
+	var interval string
+	var cacheKey *CacheKey
+
+	switch period {
+	case common.TimePeriodWeek:
+		timeFrom = tnow.AddDate(0, 0, -7).Truncate(24 * time.Hour)
+		timeFunction = "toStartOfDay(%s)"
+		interval = "INTERVAL 1 DAY"
+		cacheKey = new(CacheKey)
+		*cacheKey = propertyRuleStatsCacheKey(propertyID, timeFrom.Format(time.DateTime))
+	case common.TimePeriodMonth:
+		timeFrom = tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour)
+		timeFunction = "toStartOfDay(%s)"
+		interval = "INTERVAL 1 DAY"
+		cacheKey = new(CacheKey)
+		*cacheKey = propertyRuleStatsCacheKey(propertyID, timeFrom.Format(time.DateTime))
+	}
+
+	if cacheKey != nil {
+		if stats, err := FetchCachedArray[common.TimeCount](ctx, ts.Cache, *cacheKey); (err == nil) && (len(stats) > 0) {
+			slog.DebugContext(ctx, "Property rule stats were cached", "orgID", orgID, "propertyID", propertyID, "key", *cacheKey, "count", len(stats))
+			return stats, nil
+		}
+	}
+
+	query := fmt.Sprintf(`SELECT
+		toDateTime(%s) AS agg_time,
+		sum(count) AS count
+	FROM %s FINAL
+	WHERE user_id = {user_id:UInt32} AND org_id = {org_id:UInt32} AND property_id = {property_id:UInt32} AND timestamp >= {timestamp:DateTime}
+	GROUP BY agg_time
+	ORDER BY agg_time WITH FILL FROM toDateTime(%s) TO now() STEP %s
+	SETTINGS use_query_cache = true, query_cache_nondeterministic_function_handling = 'save'`,
+		fmt.Sprintf(timeFunction, "timestamp"),
+		RulesLogsTableName1d,
+		fmt.Sprintf(timeFunction, "{timestamp:DateTime}"),
+		interval)
+
+	rows, err := ts.Clickhouse.Query(query,
+		clickhouse.Named("user_id", strconv.Itoa(int(userID))),
+		clickhouse.Named("org_id", strconv.Itoa(int(orgID))),
+		clickhouse.Named("property_id", strconv.Itoa(int(propertyID))),
+		clickhouse.Named("timestamp", timeFrom.Format(time.DateTime)))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to query property rule stats", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	results := make([]*common.TimeCount, 0)
+
+	for rows.Next() {
+		bc := &common.TimeCount{}
+		if err := rows.Scan(&bc.Timestamp, &bc.Count); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from property rule stats query", common.ErrAttr(err))
+			return nil, err
+		}
+		results = append(results, bc)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in property rule stats query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	slog.InfoContext(ctx, "Fetched rule stats", "count", len(results), "orgID", orgID, "propID", propertyID,
+		"from", timeFrom, "period", period)
+
+	if cacheKey != nil {
+		const propertyRuleStatsCacheTTL = 5 * time.Minute
+		_ = ts.Cache.SetEx(ctx, *cacheKey, results, propertyRuleStatsCacheTTL, statsRefresh)
+	}
+
+	return results, nil
+}
+
+func (ts *TimeSeriesDB) RetrieveRecentTopProperties(ctx context.Context, limit int) (map[int32]uint, error) {
+	if !ts.IsAvailable() {
+		return nil, ErrMaintenance
+	}
+
+	// NOTE: we don't use FINAL here because this is just an approximation anyways
+	// that is used to warmup cache so we don't need the most precise results
+	query := `SELECT property_id
+FROM %s
+WHERE timestamp >= now() - INTERVAL 1 DAY
+GROUP BY property_id
+ORDER BY sum(success_count + failure_count) DESC
+LIMIT %d`
+	rows, err := ts.Clickhouse.Query(fmt.Sprintf(query, VerifyLogTable1d, limit))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute top usage query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	properties := make(map[int32]uint, limit)
+
+	for rows.Next() {
+		var propertyID int32
+		if err := rows.Scan(&propertyID); err != nil {
+			slog.ErrorContext(ctx, "Failed to read row from top usage query", common.ErrAttr(err))
+			return nil, err
+		}
+		properties[propertyID]++
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.ErrorContext(ctx, "Row iteration error in top properties query", common.ErrAttr(err))
+		return nil, err
+	}
+
+	return properties, nil
+}
+
+func (ts *TimeSeriesDB) lightDelete(ctx context.Context, tables []string, column string, ids string) error {
+	for _, table := range tables {
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)", table, column, ids)
+		if _, err := ts.Clickhouse.Exec(query); err != nil {
+			slog.ErrorContext(ctx, "Failed to delete data", "table", table, "column", column, common.ErrAttr(err))
+			return err
+		}
+		slog.InfoContext(ctx, "Deleted data in ClickHouse", "column", column, "table", table)
+	}
+
+	return nil
+}
+
+func (ts *TimeSeriesDB) DeleteFormsData(ctx context.Context, formIDs []int32) error {
+	if len(formIDs) == 0 {
+		slog.WarnContext(ctx, "Nothing to delete from ClickHouse")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	ids := idsToString(formIDs)
+	tables := []string{FormSubmitLogTableName1h, FormSubmitLogTableName1d, FormSubmitLogTableName1mo}
+
+	tnow := time.Now().UTC()
+	timeFrom := tnow.AddDate(0, 0, -1).Truncate(1 * time.Hour)
+	strCacheKey := timeFrom.Format(time.DateTime)
+	for _, formID := range formIDs {
+		cacheKey := FormStatsCacheKey(formID, strCacheKey)
+		_ = ts.Cache.Delete(ctx, cacheKey)
+	}
+
+	return ts.lightDelete(ctx, tables, "form_id", ids)
+}
+
+func (ts *TimeSeriesDB) DeletePropertiesData(ctx context.Context, propertyIDs []int32) error {
+	if len(propertyIDs) == 0 {
+		slog.WarnContext(ctx, "Nothing to delete from ClickHouse")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	ids := idsToString(propertyIDs)
+
+	// NOTE: access table for 1 month is not included as it does not have property_id column
+	tables := []string{
+		PuzzleStatsOutcomesTable, PuzzleStatsIPDailyTable, PuzzleStatsUserAgentDailyTable,
+		AccessLogTableName5m, AccessLogTableName1h, AccessLogTableName1d,
+		VerifyLogTable1h, VerifyLogTable1d, RulesLogsTableName1d,
+	}
+
+	tnow := time.Now().UTC()
+	timeFrom := tnow.AddDate(0, 0, -1).Truncate(1 * time.Hour)
+	strCacheKey := timeFrom.Format(time.DateTime)
+	weekCacheKey := tnow.AddDate(0, 0, -7).Truncate(24 * time.Hour).Format(time.DateTime)
+	monthCacheKey := tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour).Format(time.DateTime)
+	for _, propertyID := range propertyIDs {
+		cacheKey := propertyStatsCacheKey(propertyID, strCacheKey)
+		_ = ts.Cache.Delete(ctx, cacheKey)
+		_ = ts.Cache.Delete(ctx, propertyRuleStatsCacheKey(propertyID, weekCacheKey))
+		_ = ts.Cache.Delete(ctx, propertyRuleStatsCacheKey(propertyID, monthCacheKey))
+	}
+
+	return ts.lightDelete(ctx, tables, "property_id", ids)
+}
+
+func (ts *TimeSeriesDB) DeleteOrganizationsData(ctx context.Context, orgIDs []int32) error {
+	if len(orgIDs) == 0 {
+		slog.WarnContext(ctx, "Nothing to delete from ClickHouse")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	ids := idsToString(orgIDs)
+	if err := ts.lightDelete(ctx, []string{PuzzleStatsOutcomesTable}, "finalizeAggregation(org_id)", ids); err != nil {
+		return err
+	}
+
+	tables := []string{
+		AccessLogTableName5m, AccessLogTableName1h, AccessLogTableName1d, AccessLogTableName1mo,
+		VerifyLogTable1h, VerifyLogTable1d, VerifyLogTable1mo, RulesLogsTableName1d,
+		FormSubmitLogTableName1h, FormSubmitLogTableName1d, FormSubmitLogTableName1mo,
+		PuzzleStatsIPDailyTable, PuzzleStatsIPMonthlyTable,
+		PuzzleStatsUserAgentDailyTable, PuzzleStatsUserAgentMonthlyTable,
+	}
+
+	return ts.lightDelete(ctx, tables, "org_id", ids)
+}
+
+func (ts *TimeSeriesDB) DeleteUsersData(ctx context.Context, userIDs []int32) error {
+	if len(userIDs) == 0 {
+		slog.WarnContext(ctx, "Nothing to delete from ClickHouse")
+		return nil
+	}
+
+	if !ts.IsAvailable() {
+		return ErrMaintenance
+	}
+
+	ids := idsToString(userIDs)
+	if err := ts.lightDelete(ctx, []string{PuzzleStatsOutcomesTable}, "finalizeAggregation(user_id)", ids); err != nil {
+		return err
+	}
+
+	tables := []string{
+		AccessLogTableName5m, AccessLogTableName1h, AccessLogTableName1d, AccessLogTableName1mo,
+		VerifyLogTable1h, VerifyLogTable1d, VerifyLogTable1mo, RulesLogsTableName1d,
+		FormSubmitLogTableName1h, FormSubmitLogTableName1d, FormSubmitLogTableName1mo,
+		PuzzleStatsIPDailyTable, PuzzleStatsIPMonthlyTable,
+		PuzzleStatsUserAgentDailyTable, PuzzleStatsUserAgentMonthlyTable,
+	}
+
+	return ts.lightDelete(ctx, tables, "user_id", ids)
+}
+
+type MemoryTimeSeries struct {
+	mu             sync.RWMutex
+	accessLogs     []*common.AccessRecord
+	verifyLogs     []*common.VerifyRecord
+	formSubmitLogs []*common.FormSubmitRecord
+}
+
+var _ common.TimeSeriesStore = (*MemoryTimeSeries)(nil)
+
+func NewMemoryTimeSeries() *MemoryTimeSeries {
+	return &MemoryTimeSeries{
+		accessLogs:     make([]*common.AccessRecord, 0),
+		verifyLogs:     make([]*common.VerifyRecord, 0),
+		formSubmitLogs: make([]*common.FormSubmitRecord, 0),
+	}
+}
+
+func (m *MemoryTimeSeries) Ping(ctx context.Context) error {
+	return nil
+}
+
+func (m *MemoryTimeSeries) DropCache(ctx context.Context, tag string) error {
+	return nil
+}
+
+func (m *MemoryTimeSeries) WriteAccessLogBatch(ctx context.Context, records []*common.AccessRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.accessLogs = append(m.accessLogs, records...)
+	return nil
+}
+
+func (m *MemoryTimeSeries) WriteVerifyLogBatch(ctx context.Context, records []*common.VerifyRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifyLogs = append(m.verifyLogs, records...)
+	return nil
+}
+
+func (m *MemoryTimeSeries) WriteFormSubmitBatch(ctx context.Context, records []*common.FormSubmitRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.formSubmitLogs = append(m.formSubmitLogs, records...)
+	return nil
+}
+
+func (m *MemoryTimeSeries) RetrievePropertyStatsSince(ctx context.Context, r *common.BackfillRequest, from time.Time) ([]*common.TimeCount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	counts := make(map[time.Time]uint32)
+	for _, log := range m.accessLogs {
+		if log.OrgID == r.OrgID && log.UserID == r.UserID && log.PropertyID == r.PropertyID && !log.Timestamp.Before(from) {
+			// Real DB uses request_logs_5m which is aggregated by 5 minutes
+			ts := log.Timestamp.Truncate(5 * time.Minute)
+			counts[ts]++
+		}
+	}
+
+	return mapToTimeCount(counts), nil
+}
+
+func (m *MemoryTimeSeries) RetrieveAccountStats(ctx context.Context, userID int32, from time.Time) ([]*common.OrgTimeCount, error) {
+	return m.retrieveAccountStats(userID, from, func(t time.Time) time.Time {
+		year, month, _ := t.Date()
+		return time.Date(year, month, 1, 0, 0, 0, 0, t.Location())
+	})
+}
+
+func (m *MemoryTimeSeries) RetrieveAccountStatsByPeriod(ctx context.Context, userID int32, from time.Time, period common.TimePeriod) ([]*common.OrgTimeCount, error) {
+	var truncate func(time.Time) time.Time
+	switch period {
+	case common.TimePeriodToday:
+		truncate = func(t time.Time) time.Time { return t.Truncate(time.Hour) }
+	case common.TimePeriodWeek, common.TimePeriodMonth:
+		truncate = func(t time.Time) time.Time {
+			year, month, day := t.Date()
+			return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
+		}
+	case common.TimePeriodYear:
+		truncate = func(t time.Time) time.Time {
+			year, month, _ := t.Date()
+			return time.Date(year, month, 1, 0, 0, 0, 0, t.Location())
+		}
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	return m.retrieveAccountStats(userID, from, truncate)
+}
+
+func (m *MemoryTimeSeries) retrieveAccountStats(userID int32, from time.Time, truncate func(time.Time) time.Time) ([]*common.OrgTimeCount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	reqCounts := make(map[int32]map[time.Time]uint32)
+	for _, log := range m.accessLogs {
+		if log.UserID == userID && !log.Timestamp.Before(from) {
+			ts := truncate(log.Timestamp)
+			if _, ok := reqCounts[log.OrgID]; !ok {
+				reqCounts[log.OrgID] = make(map[time.Time]uint32)
+			}
+			reqCounts[log.OrgID][ts]++
+		}
+	}
+
+	verCounts := make(map[int32]map[time.Time]uint32)
+	for _, log := range m.verifyLogs {
+		if log.UserID == userID && !log.Timestamp.Before(from) {
+			ts := truncate(log.Timestamp)
+			if _, ok := verCounts[log.OrgID]; !ok {
+				verCounts[log.OrgID] = make(map[time.Time]uint32)
+			}
+			verCounts[log.OrgID][ts]++
+		}
+	}
+
+	// For each organization and time bucket, use max of request and verify counts.
+	counts := make(map[int32]map[time.Time]uint32)
+	for orgID, orgCounts := range reqCounts {
+		counts[orgID] = make(map[time.Time]uint32)
+		for ts, count := range orgCounts {
+			counts[orgID][ts] = count
+		}
+	}
+	for orgID, orgCounts := range verCounts {
+		if _, ok := counts[orgID]; !ok {
+			counts[orgID] = make(map[time.Time]uint32)
+		}
+		for ts, count := range orgCounts {
+			if count > counts[orgID][ts] {
+				counts[orgID][ts] = count
+			}
+		}
+	}
+
+	results := make([]*common.OrgTimeCount, 0)
+	for orgID, orgCounts := range counts {
+		for ts, count := range orgCounts {
+			results = append(results, &common.OrgTimeCount{OrgID: orgID, Timestamp: ts, Count: count})
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].OrgID == results[j].OrgID {
+			return results[i].Timestamp.Before(results[j].Timestamp)
+		}
+		return results[i].OrgID < results[j].OrgID
+	})
+
+	return results, nil
+}
+
+func (m *MemoryTimeSeries) memoryAccountReportStats(userIDs []int32, from, mid, to time.Time) (map[int32]*common.UserReportAccountStats, error) {
+	stats, _, err := requestedAccountReportStats(userIDs)
+	if err != nil || len(stats) == 0 {
+		return stats, err
+	}
+
+	for _, log := range m.accessLogs {
+		stat, ok := stats[log.UserID]
+		if !ok || log.Timestamp.Before(from) || !log.Timestamp.Before(to) {
+			continue
+		}
+		if log.Timestamp.Before(mid) {
+			stat.PrevRequests++
+		} else {
+			stat.CurrentRequests++
+		}
+	}
+	for _, log := range m.verifyLogs {
+		stat, ok := stats[log.UserID]
+		if !ok || log.Timestamp.Before(from) || !log.Timestamp.Before(to) {
+			continue
+		}
+		if log.Timestamp.Before(mid) {
+			stat.PrevVerifies++
+		} else {
+			stat.CurrentVerifies++
+		}
+	}
+	return stats, nil
+}
+
+func (m *MemoryTimeSeries) RetrieveWeeklyAccountReportStats(ctx context.Context, userIDs []int32, from, mid, to time.Time) (map[int32]*common.UserReportAccountStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryAccountReportStats(userIDs, from, mid, to)
+}
+
+func (m *MemoryTimeSeries) RetrieveMonthlyAccountReportStats(ctx context.Context, userIDs []int32, from, mid, to time.Time) (map[int32]*common.UserReportAccountStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryAccountReportStats(userIDs, from, mid, to)
+}
+
+func (m *MemoryTimeSeries) memoryReportStats(userID int32, from, mid, to time.Time, options common.UserReportOptions) (*common.UserReportStats, error) {
+	if userID <= 0 || invalidUserReportOptions(options) {
+		return nil, ErrInvalidInput
+	}
+
+	type propKey struct {
+		PropertyID int32
+		OrgID      int32
+	}
+
+	type propCounts struct {
+		CurrentRequests uint64
+		PrevRequests    uint64
+	}
+
+	type candidateKey struct {
+		propKey
+		Timestamp time.Time
+	}
+
+	type candidateCounts struct {
+		Requests       uint64
+		Verifies       uint64
+		FailedVerifies uint64
+	}
+	counts := make(map[propKey]*propCounts)
+	candidates := make(map[candidateKey]*candidateCounts)
+	dayStart := func(t time.Time) time.Time {
+		year, month, day := t.UTC().Date()
+		return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	}
+
+	for _, log := range m.accessLogs {
+		if log.UserID == userID && !log.Timestamp.Before(from) && log.Timestamp.Before(to) {
+			key := propKey{PropertyID: log.PropertyID, OrgID: log.OrgID}
+			if counts[key] == nil {
+				counts[key] = &propCounts{}
+			}
+			if !log.Timestamp.Before(mid) {
+				counts[key].CurrentRequests++
+				candidateKey := candidateKey{propKey: key, Timestamp: dayStart(log.Timestamp)}
+				if candidates[candidateKey] == nil {
+					candidates[candidateKey] = &candidateCounts{}
+				}
+				candidates[candidateKey].Requests++
+			} else {
+				counts[key].PrevRequests++
+			}
+		}
+	}
+
+	for _, log := range m.verifyLogs {
+		if log.UserID != userID || log.Timestamp.Before(mid) || !log.Timestamp.Before(to) {
+			continue
+		}
+		key := candidateKey{
+			propKey:   propKey{PropertyID: log.PropertyID, OrgID: log.OrgID},
+			Timestamp: dayStart(log.Timestamp),
+		}
+		if candidates[key] == nil {
+			candidates[key] = &candidateCounts{}
+		}
+		candidates[key].Verifies++
+		if log.Status != 0 {
+			candidates[key].FailedVerifies++
+		}
+	}
+
+	stats := &common.UserReportStats{}
+	for key, c := range counts {
+		if c.CurrentRequests == 0 {
+			continue
+		}
+		stats.Properties = append(stats.Properties, &common.UserReportPropertyStat{
+			PropertyID:      key.PropertyID,
+			OrgID:           key.OrgID,
+			CurrentRequests: c.CurrentRequests,
+			PrevRequests:    c.PrevRequests,
+		})
+	}
+
+	sortUserReportProperties(stats.Properties)
+	if len(stats.Properties) > options.TopPropertiesLimit {
+		stats.Properties = stats.Properties[:options.TopPropertiesLimit]
+	}
+	if options.SecurityEventsLimit == 0 || options.SecurityEventsPerPropertyLimit == 0 {
+		return stats, nil
+	}
+
+	qualifyingCandidates := make([]*common.UserReportSecurityEvent, 0, len(candidates))
+	highRequestCandidates := make([]*common.UserReportSecurityEvent, 0, len(candidates))
+	for key, counts := range candidates {
+		candidate := &common.UserReportSecurityEvent{
+			PropertyID:     key.PropertyID,
+			OrgID:          key.OrgID,
+			Timestamp:      key.Timestamp,
+			Requests:       counts.Requests,
+			Verifies:       counts.Verifies,
+			FailedVerifies: counts.FailedVerifies,
+		}
+		qualified, failureQualified := reportSecurityEventQualifications(candidate, options)
+		candidate.FailureQualified = failureQualified
+		if qualified {
+			qualifyingCandidates = append(qualifyingCandidates, candidate)
+		} else if candidate.Requests > 0 {
+			highRequestCandidates = append(highRequestCandidates, candidate)
+		}
+	}
+
+	stats.SecurityEvents = limitReportSecurityEventsByProperty(qualifyingCandidates, options.SecurityEventsLimit, options.SecurityEventsPerPropertyLimit)
+	highRequestEvents := limitReportSecurityEventsByProperty(highRequestCandidates, highRequestSecurityEventsLimit(options.SecurityEventsLimit), options.SecurityEventsPerPropertyLimit)
+	stats.SecurityEvents = append(stats.SecurityEvents, highRequestEvents...)
+
+	return stats, nil
+}
+
+func (m *MemoryTimeSeries) RetrieveWeeklyPropertiesReportStats(ctx context.Context, userID int32, from, mid, to time.Time, options common.UserReportOptions) (*common.UserReportStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryReportStats(userID, from, mid, to, options)
+}
+
+func (m *MemoryTimeSeries) RetrieveMonthlyPropertiesReportStats(ctx context.Context, userID int32, from, mid, to time.Time, options common.UserReportOptions) (*common.UserReportStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryReportStats(userID, from, mid, to, options)
+}
+
+func (m *MemoryTimeSeries) memoryFormsReportStats(userID int32, from, mid, to time.Time) *common.UserFormsReportStats {
+	type formKey struct {
+		FormID int32
+		OrgID  int32
+	}
+
+	type formCounts struct {
+		CurrentSubmissions uint64
+		PrevSubmissions    uint64
+		CurrentErrors      uint64
+		PrevErrors         uint64
+	}
+
+	counts := make(map[formKey]*formCounts)
+
+	for _, log := range m.formSubmitLogs {
+		if log.UserID != userID || log.Timestamp.Before(from) || !log.Timestamp.Before(to) {
+			continue
+		}
+
+		key := formKey{FormID: log.FormID, OrgID: log.OrgID}
+		if counts[key] == nil {
+			counts[key] = &formCounts{}
+		}
+
+		isCurrent := !log.Timestamp.Before(mid)
+		if isCurrent {
+			counts[key].CurrentSubmissions++
+			if log.Status != 0 {
+				counts[key].CurrentErrors++
+			}
+		} else {
+			counts[key].PrevSubmissions++
+			if log.Status != 0 {
+				counts[key].PrevErrors++
+			}
+		}
+	}
+
+	stats := &common.UserFormsReportStats{}
+	for key, c := range counts {
+		stats.Forms = append(stats.Forms, &common.UserReportFormStat{
+			FormID:             key.FormID,
+			OrgID:              key.OrgID,
+			CurrentSubmissions: c.CurrentSubmissions,
+			PrevSubmissions:    c.PrevSubmissions,
+			CurrentErrors:      c.CurrentErrors,
+			PrevErrors:         c.PrevErrors,
+		})
+		stats.TotalCurrentSubmissions += c.CurrentSubmissions
+		stats.TotalPrevSubmissions += c.PrevSubmissions
+		stats.TotalCurrentErrors += c.CurrentErrors
+		stats.TotalPrevErrors += c.PrevErrors
+	}
+
+	sort.Slice(stats.Forms, func(i, j int) bool {
+		return stats.Forms[i].CurrentSubmissions > stats.Forms[j].CurrentSubmissions
+	})
+
+	return stats
+}
+
+func (m *MemoryTimeSeries) RetrieveWeeklyFormsReportStats(ctx context.Context, userID int32, from, mid, to time.Time) (*common.UserFormsReportStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryFormsReportStats(userID, from, mid, to), nil
+}
+
+func (m *MemoryTimeSeries) RetrieveMonthlyFormsReportStats(ctx context.Context, userID int32, from, mid, to time.Time) (*common.UserFormsReportStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.memoryFormsReportStats(userID, from, mid, to), nil
+}
+
+func (m *MemoryTimeSeries) RetrieveOrgStatsByPeriod(ctx context.Context, orgID int32, period common.TimePeriod, topPropertiesLimit int) (*common.OrgTimePeriodStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if topPropertiesLimit <= 0 {
+		return nil, ErrInvalidInput
+	}
+
+	from := getStartTime(period)
+	var truncate func(time.Time) time.Time
+	switch period {
+	case common.TimePeriodToday:
+		truncate = func(t time.Time) time.Time { return t.Truncate(time.Hour) }
+	case common.TimePeriodWeek, common.TimePeriodMonth:
+		truncate = func(t time.Time) time.Time {
+			year, month, day := t.Date()
+			return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
+		}
+	case common.TimePeriodYear:
+		truncate = func(t time.Time) time.Time {
+			year, month, _ := t.Date()
+			return time.Date(year, month, 1, 0, 0, 0, 0, t.Location())
+		}
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	propertyVolumes := make(map[int32]int)
+	for _, log := range m.accessLogs {
+		if log.OrgID == orgID && !log.Timestamp.Before(from) {
+			propertyVolumes[log.PropertyID]++
+		}
+	}
+	for _, log := range m.verifyLogs {
+		if log.OrgID == orgID && !log.Timestamp.Before(from) {
+			propertyVolumes[log.PropertyID]++
+		}
+	}
+
+	type propertyVolume struct {
+		propertyID int32
+		volume     int
+	}
+	ranked := make([]propertyVolume, 0, len(propertyVolumes))
+	for propertyID, volume := range propertyVolumes {
+		ranked = append(ranked, propertyVolume{propertyID: propertyID, volume: volume})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].volume != ranked[j].volume {
+			return ranked[i].volume > ranked[j].volume
+		}
+		return ranked[i].propertyID < ranked[j].propertyID
+	})
+
+	stats := &common.OrgTimePeriodStats{
+		PropertyIDs: make([]int32, 0, min(len(ranked), topPropertiesLimit)+1),
+		Points:      make([]*common.OrgPropertyTimePeriodStat, 0),
+	}
+	topPropertyIDs := make(map[int32]struct{}, topPropertiesLimit)
+	for i := 0; i < min(len(ranked), topPropertiesLimit); i++ {
+		propertyID := ranked[i].propertyID
+		stats.PropertyIDs = append(stats.PropertyIDs, propertyID)
+		topPropertyIDs[propertyID] = struct{}{}
+	}
+	if len(ranked) > topPropertiesLimit {
+		stats.PropertyIDs = append(stats.PropertyIDs, common.OrgStatsOtherPropertyID)
+	}
+
+	type propertyTime struct {
+		propertyID int32
+		timestamp  time.Time
+	}
+	counts := make(map[propertyTime]int)
+	for _, log := range m.accessLogs {
+		if log.OrgID != orgID || log.Timestamp.Before(from) {
+			continue
+		}
+		propertyID := log.PropertyID
+		if _, ok := topPropertyIDs[propertyID]; !ok {
+			propertyID = common.OrgStatsOtherPropertyID
+		}
+		counts[propertyTime{propertyID: propertyID, timestamp: truncate(log.Timestamp)}]++
+	}
+
+	seriesOrder := make(map[int32]int, len(stats.PropertyIDs))
+	for index, propertyID := range stats.PropertyIDs {
+		seriesOrder[propertyID] = index
+	}
+	stats.Points = make([]*common.OrgPropertyTimePeriodStat, 0, len(counts))
+	for key, count := range counts {
+		stats.Points = append(stats.Points, &common.OrgPropertyTimePeriodStat{
+			PropertyID: key.propertyID, Timestamp: key.timestamp, RequestsCount: count,
+		})
+	}
+	sort.Slice(stats.Points, func(i, j int) bool {
+		if stats.Points[i].Timestamp.Equal(stats.Points[j].Timestamp) {
+			return seriesOrder[stats.Points[i].PropertyID] < seriesOrder[stats.Points[j].PropertyID]
+		}
+		return stats.Points[i].Timestamp.Before(stats.Points[j].Timestamp)
+	})
+
+	return stats, nil
+}
+
+func (m *MemoryTimeSeries) RetrievePropertyStatsByPeriod(ctx context.Context, orgID, propertyID int32, period common.TimePeriod) ([]*common.TimePeriodStat, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	from := getStartTime(period)
+	statsMap := make(map[time.Time]*common.TimePeriodStat)
+
+	// Define truncation function based on period
+	var truncate func(time.Time) time.Time
+	switch period {
+	case common.TimePeriodToday:
+		// 1h
+		truncate = func(t time.Time) time.Time { return t.Truncate(time.Hour) }
+	case common.TimePeriodWeek:
+		// Real DB uses request_logs_1d, so effectively daily resolution
+		truncate = func(t time.Time) time.Time {
+			y, m, d := t.Date()
+			return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+		}
+	case common.TimePeriodMonth:
+		// 1d
+		truncate = func(t time.Time) time.Time {
+			y, m, d := t.Date()
+			return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+		}
+	case common.TimePeriodYear:
+		// 1mo
+		truncate = func(t time.Time) time.Time {
+			y, m, _ := t.Date()
+			return time.Date(y, m, 1, 0, 0, 0, 0, t.Location())
+		}
+	default:
+		truncate = func(t time.Time) time.Time { return t.Truncate(time.Hour) }
+	}
+
+	getStat := func(t time.Time) *common.TimePeriodStat {
+		ts := truncate(t)
+		if _, ok := statsMap[ts]; !ok {
+			statsMap[ts] = &common.TimePeriodStat{Timestamp: ts}
+		}
+		return statsMap[ts]
+	}
+
+	for _, log := range m.accessLogs {
+		if log.OrgID == orgID && log.PropertyID == propertyID && !log.Timestamp.Before(from) {
+			getStat(log.Timestamp).RequestsCount++
+		}
+	}
+
+	for _, log := range m.verifyLogs {
+		if log.OrgID == orgID && log.PropertyID == propertyID && !log.Timestamp.Before(from) {
+			getStat(log.Timestamp).VerifiesCount++
+		}
+	}
+
+	// Convert map to sorted slice
+	result := make([]*common.TimePeriodStat, 0, len(statsMap))
+	for _, v := range statsMap {
+		result = append(result, v)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Timestamp.Before(result[j].Timestamp) })
+
+	return result, nil
+}
+
+func (m *MemoryTimeSeries) RetrieveFormStatsByPeriod(ctx context.Context, orgID, formID int32, period common.TimePeriod) ([]*common.FormSubmitStat, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tnow := time.Now().UTC()
+	var from time.Time
+	statsMap := make(map[time.Time]*common.FormSubmitStat)
+
+	var truncate func(time.Time) time.Time
+	switch period {
+	case common.TimePeriodToday:
+		from = tnow.AddDate(0, 0, -1).Truncate(time.Hour)
+		truncate = func(t time.Time) time.Time { return t.UTC().Truncate(time.Hour) }
+	case common.TimePeriodWeek:
+		from = tnow.AddDate(0, 0, -7).Truncate(24 * time.Hour)
+		truncate = func(t time.Time) time.Time {
+			y, m, d := t.UTC().Date()
+			return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+		}
+	case common.TimePeriodMonth:
+		from = tnow.AddDate(0, -1, 0).Truncate(24 * time.Hour)
+		truncate = func(t time.Time) time.Time {
+			y, m, d := t.UTC().Date()
+			return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+		}
+	case common.TimePeriodYear:
+		from = tnow.AddDate(-1, 0, 0).Truncate(24 * time.Hour)
+		truncate = func(t time.Time) time.Time {
+			y, m, _ := t.UTC().Date()
+			return time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
+		}
+	default:
+		return nil, ErrUnsupportedPeriod
+	}
+
+	for _, log := range m.formSubmitLogs {
+		if log.OrgID != orgID || log.FormID != formID || log.Timestamp.UTC().Before(from) {
+			continue
+		}
+
+		ts := truncate(log.Timestamp)
+		if _, ok := statsMap[ts]; !ok {
+			statsMap[ts] = &common.FormSubmitStat{Timestamp: ts}
+		}
+		if log.Status == 0 {
+			statsMap[ts].SuccessCount++
+		} else {
+			statsMap[ts].FailureCount++
+		}
+	}
+
+	result := make([]*common.FormSubmitStat, 0, len(statsMap))
+	for _, stat := range statsMap {
+		result = append(result, stat)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Timestamp.Before(result[j].Timestamp) })
+
+	return result, nil
+}
+
+func (m *MemoryTimeSeries) RetrieveFailingForms(ctx context.Context, threshold, limit int) ([]*common.FailingFormCandidate, error) {
+	if (threshold <= 0) || (limit <= 0) {
+		return nil, ErrInvalidInput
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	type formHourKey struct {
+		formID    int32
+		timestamp time.Time
+	}
+
+	from := time.Now().UTC().Add(-24 * time.Hour)
+	stats := make(map[formHourKey]*common.FormSubmitStat)
+	for _, log := range m.formSubmitLogs {
+		if log.Timestamp.UTC().Before(from) {
+			continue
+		}
+
+		key := formHourKey{formID: log.FormID, timestamp: log.Timestamp.UTC().Truncate(time.Hour)}
+		if stats[key] == nil {
+			stats[key] = &common.FormSubmitStat{Timestamp: key.timestamp}
+		}
+		if log.Status == 0 {
+			stats[key].SuccessCount++
+		} else {
+			stats[key].FailureCount++
+		}
+	}
+
+	byForm := make(map[int32][]*common.FormSubmitStat)
+	for key, stat := range stats {
+		if (stat.SuccessCount + stat.FailureCount) == 0 {
+			continue
+		}
+		byForm[key.formID] = append(byForm[key.formID], stat)
+	}
+
+	results := make([]*common.FailingFormCandidate, 0)
+	for formID, formStats := range byForm {
+		sort.Slice(formStats, func(i, j int) bool { return formStats[i].Timestamp.After(formStats[j].Timestamp) })
+		if len(formStats) < threshold {
+			continue
+		}
+
+		var failureCount uint32
+		qualified := true
+		for _, stat := range formStats[:threshold] {
+			if stat.SuccessCount != 0 || stat.FailureCount == 0 {
+				qualified = false
+				break
+			}
+			failureCount += uint32(stat.FailureCount)
+		}
+
+		if qualified {
+			results = append(results, &common.FailingFormCandidate{FormID: formID, FailureCount: failureCount})
+		}
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].FailureCount == results[j].FailureCount {
+			return results[i].FormID < results[j].FormID
+		}
+		return results[i].FailureCount > results[j].FailureCount
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
+}
+
+func (m *MemoryTimeSeries) RetrievePropertyRuleStatsByPeriod(ctx context.Context, userID, orgID, propertyID int32, period common.TimePeriod) ([]*common.TimeCount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Only support week and month periods for rule stats
+	if period != common.TimePeriodWeek && period != common.TimePeriodMonth {
+		return nil, ErrUnsupportedPeriod
+	}
+
+	from := getStartTime(period).UTC()
+	statsMap := make(map[time.Time]uint32)
+
+	// For rule stats, always use daily resolution
+	truncate := func(t time.Time) time.Time {
+		y, m, d := t.UTC().Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	}
+
+	// Count only logs with rule_id > 0
+	for _, log := range m.accessLogs {
+		if log.UserID == userID && log.OrgID == orgID && log.PropertyID == propertyID && log.RuleID > 0 && !log.Timestamp.UTC().Before(from) {
+			ts := truncate(log.Timestamp)
+			statsMap[ts]++
+		}
+	}
+
+	// Convert map to sorted slice
+	result := make([]*common.TimeCount, 0, len(statsMap))
+	for ts, count := range statsMap {
+		result = append(result, &common.TimeCount{Timestamp: ts, Count: count})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Timestamp.Before(result[j].Timestamp) })
+
+	return result, nil
+}
+
+func (m *MemoryTimeSeries) RetrieveRecentTopProperties(ctx context.Context, limit int) (map[int32]uint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	since := time.Now().Add(-24 * time.Hour)
+	counts := make(map[int32]uint)
+
+	// Real DB uses verify_logs_1d (Verifications), not access logs
+	for _, log := range m.verifyLogs {
+		if !log.Timestamp.Before(since) {
+			counts[log.PropertyID]++
+		}
+	}
+
+	// For a stub, we just return the map
+	if len(counts) <= limit {
+		return counts, nil
+	}
+
+	// Minimal truncation logic for the limit (optional for a simple stub)
+	limitedCounts := make(map[int32]uint)
+	count := 0
+	for k, v := range counts {
+		if count >= limit {
+			break
+		}
+		limitedCounts[k] = v
+		count++
+	}
+
+	return limitedCounts, nil
+}
+
+func (m *MemoryTimeSeries) DeletePropertiesData(ctx context.Context, propertyIDs []int32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make(map[int32]struct{})
+	for _, id := range propertyIDs {
+		ids[id] = struct{}{}
+	}
+
+	newAccess := m.accessLogs[:0]
+	for _, log := range m.accessLogs {
+		if _, ok := ids[log.PropertyID]; !ok {
+			newAccess = append(newAccess, log)
+		}
+	}
+	m.accessLogs = newAccess
+
+	newVerify := m.verifyLogs[:0]
+	for _, log := range m.verifyLogs {
+		if _, ok := ids[log.PropertyID]; !ok {
+			newVerify = append(newVerify, log)
+		}
+	}
+	m.verifyLogs = newVerify
+
+	return nil
+}
+
+func (m *MemoryTimeSeries) DeleteFormsData(ctx context.Context, formIDs []int32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make(map[int32]struct{})
+	for _, id := range formIDs {
+		ids[id] = struct{}{}
+	}
+
+	newFormSubmitLogs := m.formSubmitLogs[:0]
+	for _, log := range m.formSubmitLogs {
+		if _, ok := ids[log.FormID]; !ok {
+			newFormSubmitLogs = append(newFormSubmitLogs, log)
+		}
+	}
+	m.formSubmitLogs = newFormSubmitLogs
+
+	return nil
+}
+
+func (m *MemoryTimeSeries) DeleteOrganizationsData(ctx context.Context, orgIDs []int32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make(map[int32]struct{})
+	for _, id := range orgIDs {
+		ids[id] = struct{}{}
+	}
+
+	newAccess := m.accessLogs[:0]
+	for _, log := range m.accessLogs {
+		if _, ok := ids[log.OrgID]; !ok {
+			newAccess = append(newAccess, log)
+		}
+	}
+	m.accessLogs = newAccess
+
+	newVerify := m.verifyLogs[:0]
+	for _, log := range m.verifyLogs {
+		if _, ok := ids[log.OrgID]; !ok {
+			newVerify = append(newVerify, log)
+		}
+	}
+	m.verifyLogs = newVerify
+
+	newFormSubmitLogs := m.formSubmitLogs[:0]
+	for _, log := range m.formSubmitLogs {
+		if _, ok := ids[log.OrgID]; !ok {
+			newFormSubmitLogs = append(newFormSubmitLogs, log)
+		}
+	}
+	m.formSubmitLogs = newFormSubmitLogs
+
+	return nil
+}
+
+func (m *MemoryTimeSeries) DeleteUsersData(ctx context.Context, userIDs []int32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make(map[int32]struct{})
+	for _, id := range userIDs {
+		ids[id] = struct{}{}
+	}
+
+	newAccess := m.accessLogs[:0]
+	for _, log := range m.accessLogs {
+		if _, ok := ids[log.UserID]; !ok {
+			newAccess = append(newAccess, log)
+		}
+	}
+	m.accessLogs = newAccess
+
+	newVerify := m.verifyLogs[:0]
+	for _, log := range m.verifyLogs {
+		if _, ok := ids[log.UserID]; !ok {
+			newVerify = append(newVerify, log)
+		}
+	}
+	m.verifyLogs = newVerify
+
+	newFormSubmitLogs := m.formSubmitLogs[:0]
+	for _, log := range m.formSubmitLogs {
+		if _, ok := ids[log.UserID]; !ok {
+			newFormSubmitLogs = append(newFormSubmitLogs, log)
+		}
+	}
+	m.formSubmitLogs = newFormSubmitLogs
+
+	return nil
+}
+
+func mapToTimeCount(m map[time.Time]uint32) []*common.TimeCount {
+	res := make([]*common.TimeCount, 0, len(m))
+	for ts, count := range m {
+		res = append(res, &common.TimeCount{Timestamp: ts, Count: count})
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Timestamp.Before(res[j].Timestamp) })
+	return res
+}
+
+func getStartTime(p common.TimePeriod) time.Time {
+	now := time.Now()
+	switch p {
+	case common.TimePeriodToday:
+		return now.AddDate(0, 0, -1)
+	case common.TimePeriodWeek:
+		return now.AddDate(0, 0, -7)
+	case common.TimePeriodMonth:
+		return now.AddDate(0, -1, 0)
+	case common.TimePeriodYear:
+		return now.AddDate(-1, 0, 0)
+	default:
+		return now
+	}
+}
+
+const insertPuzzleStats = `
+INSERT INTO privatecaptcha.puzzle_stats_finalized
+WITH outcomes AS
+(
+    SELECT
+        expires_on,
+        property_id,
+        puzzle_id,
+        argMaxMerge(user_id) AS user_id,
+        argMaxMerge(org_id) AS org_id,
+        maxMerge(fingerprint) AS fingerprint,
+        maxMerge(ip_family) AS ip_family,
+        maxMerge(ip_prefix) AS ip_prefix,
+        maxMerge(browser) AS browser,
+        maxMerge(browser_major) AS browser_major,
+        maxMerge(os) AS os,
+        maxMerge(device) AS device,
+        tupleElement(sumMapMerge(status_counts), 1) AS outcome_status_codes,
+        maxMerge(issued) AS issued
+    FROM privatecaptcha.puzzle_outcomes_recent
+    WHERE expires_on = {source_expires_on:Date}
+    GROUP BY expires_on, property_id, puzzle_id
+    HAVING issued = 1
+)
+SELECT
+    expires_on,
+    user_id,
+    org_id,
+    property_id,
+    fingerprint,
+    ip_family,
+    ip_prefix,
+    browser,
+    browser_major,
+    os,
+    device,
+    toUInt64(1) AS issued_puzzles,
+    toUInt64(length(outcome_status_codes) > 0) AS attempted_puzzles,
+    toUInt64(has(outcome_status_codes, toUInt8(0))) AS successful_puzzles
+FROM outcomes
+SETTINGS materialized_views_ignore_errors = 0`
+
+const insertPuzzleStatsIPMonthly = `
+INSERT INTO privatecaptcha.puzzle_stats_ip_monthly
+SELECT
+    {source_month:Date} AS expires_on,
+    user_id,
+    org_id,
+    ip_family,
+    ip_prefix,
+    successful_count AS success_count,
+    attempted_count - successful_count AS failure_count
+FROM
+(
+    SELECT
+        user_id,
+        org_id,
+        ip_family,
+        ip_prefix,
+        sum(attempted_puzzles) AS attempted_count,
+        sum(successful_puzzles) AS successful_count
+    FROM privatecaptcha.puzzle_stats_ip_daily
+    WHERE expires_on >= {source_month:Date}
+        AND expires_on < addMonths({source_month:Date}, 1)
+    GROUP BY user_id, org_id, ip_family, ip_prefix
+)
+WHERE attempted_count > 0`
+
+const insertPuzzleStatsUserAgentMonthly = `
+INSERT INTO privatecaptcha.puzzle_stats_user_agent_monthly
+SELECT
+    {source_month:Date} AS expires_on,
+    user_id,
+    org_id,
+    browser,
+    os,
+    device,
+    successful_count AS success_count,
+    attempted_count - successful_count AS failure_count
+FROM
+(
+    SELECT
+        user_id,
+        org_id,
+        browser,
+        os,
+        device,
+        sum(attempted_puzzles) AS attempted_count,
+        sum(successful_puzzles) AS successful_count
+    FROM privatecaptcha.puzzle_stats_user_agent_daily
+    WHERE expires_on >= {source_month:Date}
+        AND expires_on < addMonths({source_month:Date}, 1)
+    GROUP BY user_id, org_id, browser, os, device
+)
+WHERE attempted_count > 0`
+
+// FinalizeNextPuzzleStats publishes one fully elapsed UTC outcome partition.
+func (ts *TimeSeriesDB) FinalizeNextPuzzleStats(ctx context.Context, before time.Time) (bool, error) {
+	before = before.UTC().Truncate(24 * time.Hour)
+	var expiresOn time.Time
+	err := ts.Clickhouse.QueryRowContext(ctx, `
+SELECT expires_on
+FROM privatecaptcha.puzzle_outcomes_recent
+WHERE expires_on < {before:Date}
+	AND expires_on < toDate(now('UTC') - INTERVAL 2 HOUR, 'UTC')
+GROUP BY expires_on
+ORDER BY expires_on
+LIMIT 1`, clickhouse.Named("before", puzzleStatsDate(before))).Scan(&expiresOn)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if err := ts.PublishPuzzleStats(ctx, expiresOn); err != nil {
+		return false, err
+	}
+	if err := ts.dropPuzzleStatsPartition(ctx, PuzzleStatsOutcomesTable, expiresOn); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// FinalizeNextPuzzleStatsMonth publishes one sealed UTC month that has no pending outcome partitions.
+func (ts *TimeSeriesDB) FinalizeNextPuzzleStatsMonth(ctx context.Context, before time.Time) (bool, error) {
+	before = puzzleStatsMonth(before)
+	var expiresMonth time.Time
+	err := ts.Clickhouse.QueryRowContext(ctx, `
+SELECT expires_month
+FROM
+(
+	SELECT
+		toStartOfMonth(expires_on) AS expires_month,
+		sum(attempted_puzzles) AS expected_count,
+		toUInt64(0) AS published_count
+	FROM privatecaptcha.puzzle_stats_user_agent_daily
+	GROUP BY expires_month
+
+	UNION ALL
+
+	SELECT
+		expires_on AS expires_month,
+		toUInt64(0) AS expected_count,
+		sum(success_count + failure_count) AS published_count
+	FROM privatecaptcha.puzzle_stats_user_agent_monthly
+	GROUP BY expires_month
+)
+WHERE expires_month < {before:Date}
+	AND expires_month < toStartOfMonth(toDate(now('UTC') - INTERVAL 2 HOUR, 'UTC'))
+	AND expires_month NOT IN
+	(
+		SELECT toStartOfMonth(expires_on)
+		FROM privatecaptcha.puzzle_outcomes_recent
+		GROUP BY toStartOfMonth(expires_on)
+	)
+GROUP BY expires_month
+HAVING sum(expected_count) > 0
+	AND sum(published_count) < sum(expected_count)
+ORDER BY expires_month
+LIMIT 1`, clickhouse.Named("before", puzzleStatsDate(before))).Scan(&expiresMonth)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if err := ts.publishPuzzleStatsMonth(ctx, expiresMonth); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// PublishPuzzleStats replaces all daily aggregates for one outcome partition.
+func (ts *TimeSeriesDB) PublishPuzzleStats(ctx context.Context, expiresOn time.Time) error {
+	expiresOn = expiresOn.UTC().Truncate(24 * time.Hour)
+	for _, table := range []string{
+		PuzzleStatsIPDailyTable,
+		PuzzleStatsUserAgentDailyTable,
+		PuzzleStatsFingerprintDailyTable,
+	} {
+		if err := ts.dropPuzzleStatsPartition(ctx, table, expiresOn); err != nil {
+			return err
+		}
+	}
+
+	_, err := ts.Clickhouse.ExecContext(ctx, insertPuzzleStats,
+		clickhouse.Named("source_expires_on", puzzleStatsDate(expiresOn)))
+	return err
+}
+
+func (ts *TimeSeriesDB) publishPuzzleStatsMonth(ctx context.Context, expiresMonth time.Time) error {
+	expiresMonth = puzzleStatsMonth(expiresMonth)
+	for _, table := range []string{
+		PuzzleStatsUserAgentMonthlyTable,
+		PuzzleStatsIPMonthlyTable,
+	} {
+		if err := ts.dropPuzzleStatsPartition(ctx, table, expiresMonth); err != nil {
+			return err
+		}
+	}
+
+	for _, query := range []string{insertPuzzleStatsIPMonthly, insertPuzzleStatsUserAgentMonthly} {
+		if _, err := ts.Clickhouse.ExecContext(ctx, query,
+			clickhouse.Named("source_month", puzzleStatsDate(expiresMonth))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ts *TimeSeriesDB) dropPuzzleStatsPartition(ctx context.Context, table string, expiresOn time.Time) error {
+	_, err := ts.Clickhouse.ExecContext(ctx,
+		"ALTER TABLE "+table+" DROP PARTITION {source_expires_on:Date}",
+		clickhouse.Named("source_expires_on", puzzleStatsDate(expiresOn)))
+	return err
+}
+
+func puzzleStatsDate(t time.Time) string {
+	return t.UTC().Format(time.DateOnly)
+}
+
+func puzzleStatsMonth(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
