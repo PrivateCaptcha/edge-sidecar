@@ -38,6 +38,7 @@ jobs:
       run: make test-unit
 
   e2e:
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
