@@ -1,5 +1,9 @@
 # PrivateCaptcha edge sidecar
 
+![GitHub go.mod Go version](https://img.shields.io/github/go-mod/go-version/PrivateCaptcha/edge-sidecar)
+
+[![CI](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml) [![Go Lint](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml)
+
 Caddy `forward_auth` authorization with a hosted captcha fallback. The application
 needs no changes; Caddy proxies application traffic, while the sidecar handles
 only `/auth`, `/__privatecaptcha/complete`, and `/healthz`.
