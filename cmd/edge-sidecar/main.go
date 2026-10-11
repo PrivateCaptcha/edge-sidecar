@@ -18,7 +18,11 @@ import (
 	"github.com/PrivateCaptcha/edge-sidecar/pkg/api"
 )
 
-func run(ctx context.Context, s api.Settings) error {
+var (
+	GitCommit string
+)
+
+func run(ctx context.Context, s api.Settings, stage string) error {
 	keys := api.NewKeyCache(s)
 	defer keys.CloseIdleConnections()
 	if err := keys.RunOnce(ctx, keys.NewParams()); err != nil {
@@ -54,7 +58,7 @@ func run(ctx context.Context, s api.Settings) error {
 	}()
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.InfoContext(ctx, "Listening", "address", listener.Addr().String())
+		slog.InfoContext(ctx, "Listening", "address", listener.Addr().String(), "version", GitCommit, "stage", stage)
 		serveErr <- server.Serve(listener)
 	}()
 	select {
@@ -96,12 +100,13 @@ func start(envFile string) error {
 		value, _ := env.GetEx(name)
 		return value
 	})
-	common.SetupLogs(cfg.Get(common.StageKey).Value(), config.AsBool(cfg.Get(common.VerboseKey)))
+	stage := cfg.Get(common.StageKey).Value()
+	common.SetupLogs(stage, config.AsBool(cfg.Get(common.VerboseKey)))
 	s, err := api.LoadSettings(cfg)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return run(common.TraceContext(ctx, api.ServiceName), s)
+	return run(common.TraceContext(ctx, api.ServiceName), s, stage)
 }

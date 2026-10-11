@@ -37,14 +37,14 @@ test-e2e:
 	env EDGE_DOCKER_ENV="$(EDGE_DOCKER_ENV)" npm run test:e2e -- $(EXTRA_E2E_FLAGS)
 
 build-edge-sidecar:
-	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 go build -ldflags="-s -w" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar ./cmd/edge-sidecar
+	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar ./cmd/edge-sidecar
 docker/.env: docker/.env.example
 	test -e "$@" || cp -v docker/.env.example "$@"
 
 setup-edge-docker: $(EDGE_DOCKER_ENV)
 
 run-edge-docker:
-	$(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build $(EDGE_DOCKER_FLAGS)
+	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build $(EDGE_DOCKER_FLAGS)
 
 stop-edge-docker:
 	$(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) down
