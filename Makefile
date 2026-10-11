@@ -47,10 +47,10 @@ run-edge-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build $(EDGE_DOCKER_FLAGS)
 
 stop-edge-docker:
-	$(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) down
+	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) down
 
 reload-edge-docker:
-	$(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 
 logs-edge-docker:
-	$(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) logs $(EDGE_DOCKER_LOG_FLAGS) privatecaptcha-authorizer caddy
+	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) logs $(EDGE_DOCKER_LOG_FLAGS) privatecaptcha-authorizer caddy
