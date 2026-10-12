@@ -1,4 +1,4 @@
-.PHONY: build-edge-sidecar setup-edge-docker validate-edge-docker run-edge-docker stop-edge-docker reload-edge-docker logs-edge-docker
+.PHONY: build-edge-sidecar setup-edge-docker validate-edge-docker start-edge-docker run-edge-docker stop-edge-docker reload-edge-docker logs-edge-docker
 .PHONY: setup-e2e test-e2e
 
 STAGE ?= dev
@@ -56,6 +56,9 @@ setup-edge-docker: $(EDGE_DOCKER_ENV)
 
 validate-edge-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) config --quiet
+
+start-edge-docker:
+	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build --detach $(EDGE_DOCKER_FLAGS)
 
 run-edge-docker:
 	$(if $(filter -d --detach% --wait --wait=%,$(EDGE_DOCKER_FLAGS)),$(error run-edge-docker requires attached foreground mode; detach and wait flags are not supported))

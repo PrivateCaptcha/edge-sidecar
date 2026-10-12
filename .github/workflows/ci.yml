@@ -77,28 +77,26 @@ jobs:
     - name: Run the demo and E2E tests
       run: |
         make validate-edge-docker
-        (
-          trap 'make stop-edge-docker' EXIT
-          ready=false
-          for attempt in {1..60}; do
-            if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
-              --output /dev/null --write-out '%{http_code}' \
-              "https://${PC_EDGE_HOST}:${PC_EDGE_PORT}/private") && [ "$status" = '401' ]; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" != true ]; then
-            printf 'Sidecar was not ready after %s attempts (HTTP %s)\n' "$attempt" "$status" >&2
-            exit 1
+        make start-edge-docker
+        ready=false
+        for attempt in {1..60}; do
+          if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://${PC_EDGE_HOST}:${PC_EDGE_PORT}/private") && [ "$status" = '401' ]; then
+            ready=true
+            break
           fi
-          make test-e2e
-        ) &
-        tests_pid=$!
-        trap 'if kill -0 "$tests_pid" 2>/dev/null; then kill "$tests_pid"; fi' EXIT
-        make run-edge-docker EDGE_DOCKER_FLAGS=--abort-on-container-exit
-        wait "$tests_pid"
+          sleep 1
+        done
+        if [ "$ready" != true ]; then
+          printf 'Sidecar was not ready after %s attempts (HTTP %s)\n' "$attempt" "$status" >&2
+          exit 1
+        fi
+        make test-e2e
+
+    - name: Show demo logs on failure
+      if: failure()
+      run: make logs-edge-docker EDGE_DOCKER_LOG_FLAGS=--no-color
 
     - name: Upload Playwright failure artifacts
       if: failure()
