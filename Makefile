@@ -3,6 +3,8 @@
 
 STAGE ?= dev
 GIT_COMMIT ?= $(shell git rev-list -1 HEAD)
+GOARCH ?= amd64
+BUILD_OUTPUT ?= bin/edge-sidecar
 DOCKER ?= docker
 EXTRA_BUILD_FLAGS ?=
 EXTRA_TEST_FLAGS ?=
@@ -42,10 +44,10 @@ test-e2e:
 	env EDGE_PROXY="$(EDGE_PROXY)" EDGE_DOCKER_ENV="$(EDGE_DOCKER_ENV)" npm run test:e2e -- $(EXTRA_E2E_FLAGS)
 
 build-edge-sidecar:
-	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar ./cmd/edge-sidecar
+	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o "$(BUILD_OUTPUT)" ./cmd/edge-sidecar
 
 build-edge-sidecar-prod:
-	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar-prod ./cmd/edge-sidecar
+	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar-prod ./cmd/edge-sidecar
 
 docker/.env: docker/.env.example
 	test -e "$@" || cp -v docker/.env.example "$@"

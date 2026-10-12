@@ -1,0 +1,105 @@
+name: GitHub release
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run unit tests
+        run: make test-unit
+
+  approve-release:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: GitHub release
+    steps:
+      - name: Release approved
+        run: printf 'Release approved for %s\n' "$GITHUB_REF_NAME"
+
+  build:
+    name: Build (linux/${{ matrix.arch }})
+    needs: approve-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build binary
+        run: make build GOARCH="$GOARCH" BUILD_OUTPUT="bin/edge-sidecar-linux-${GOARCH}"
+
+      - name: Generate SHA256 checksum
+        working-directory: bin
+        run: sha256sum "edge-sidecar-linux-${GOARCH}" > "edge-sidecar-linux-${GOARCH}.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: edge-sidecar-linux-${{ matrix.arch }}
+          path: |
+            bin/edge-sidecar-linux-${{ matrix.arch }}
+            bin/edge-sidecar-linux-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: edge-sidecar-linux-*
+          path: bin
+          merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: bin
+        run: sha256sum --check ./*.sha256
+
+      - name: Create release
+        working-directory: bin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" edge-sidecar-linux-* --verify-tag --generate-notes
