@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,27 +23,78 @@ var (
 	GitCommit string
 )
 
-func run(ctx context.Context, s api.Settings, stage string) error {
-	slog.InfoContext(ctx, "Starting edge sidecar", "address", s.Address, "version", GitCommit, "stage", stage)
+type authorizerState struct {
+	keys       *api.KeyCache
+	authorizer *api.Authorizer
+	router     *http.ServeMux
+	stopJobs   context.CancelFunc
+	jobsDone   chan struct{}
+}
+
+func newAuthorizerState(ctx context.Context, s api.Settings, previous *authorizerState) (*authorizerState, error) {
 	keys := api.NewKeyCache(s)
-	defer keys.CloseIdleConnections()
 	if err := keys.RunOnce(ctx, keys.NewParams()); err != nil {
-		return fmt.Errorf("initial JWKS fetch: %w", err)
+		keys.CloseIdleConnections()
+		return nil, fmt.Errorf("initial JWKS fetch: %w", err)
 	}
+	var authorizer *api.Authorizer
+	var err error
+	if previous == nil {
+		authorizer, err = api.NewAuthorizer(s, keys)
+	} else {
+		authorizer, err = previous.authorizer.Reconfigure(s, keys)
+	}
+	if err != nil {
+		keys.CloseIdleConnections()
+		return nil, err
+	}
+	router := http.NewServeMux()
+	authorizer.Setup(router)
+	jobsCtx, stopJobs := context.WithCancel(ctx)
+	state := &authorizerState{
+		keys:       keys,
+		authorizer: authorizer,
+		router:     router,
+		stopJobs:   stopJobs,
+		jobsDone:   make(chan struct{}),
+	}
+	go func() {
+		defer close(state.jobsDone)
+		common.RunPeriodicJob(jobsCtx, keys)
+	}()
+	return state, nil
+}
+
+func (s *authorizerState) close() {
+	s.stopJobs()
+	<-s.jobsDone
+	s.keys.CloseIdleConnections()
+}
+
+func run(ctx context.Context, env *common.EnvMap, cfg common.ConfigStore, reloads <-chan os.Signal) error {
+	stage := cfg.Get(common.StageKey).Value()
+	common.SetupLogs(stage, config.AsBool(cfg.Get(common.VerboseKey)))
+	s, err := api.LoadSettings(cfg)
+	if err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "Starting edge sidecar", "address", s.Address, "version", GitCommit, "stage", stage)
+	state, err := newAuthorizerState(ctx, s, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { state.close() }()
 	listener, err := net.Listen("tcp", s.Address)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-
-	authorizer, err := api.NewAuthorizer(s, keys)
-	if err != nil {
-		return err
-	}
-	router := http.NewServeMux()
-	authorizer.Setup(router)
+	var active atomic.Pointer[authorizerState]
+	active.Store(state)
 	server := &http.Server{
-		Handler:           router,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			active.Load().router.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 3 * time.Second,
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -50,34 +102,59 @@ func run(ctx context.Context, s api.Settings, stage string) error {
 		MaxHeaderBytes:    16 * 1024,
 		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
 	}
-	jobsCtx, stopJobs := context.WithCancel(ctx)
-	defer stopJobs()
-	jobsDone := make(chan struct{})
-	go func() {
-		defer close(jobsDone)
-		common.RunPeriodicJob(jobsCtx, keys)
-	}()
 	serveErr := make(chan error, 1)
-	go func() {
+	go func(stage string) {
 		slog.InfoContext(ctx, "Listening", "address", listener.Addr().String(), "version", GitCommit, "stage", stage)
 		serveErr <- server.Serve(listener)
-	}()
-	select {
-	case <-ctx.Done():
-	case err = <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
+	}(stage)
+serve:
+	for {
+		select {
+		case <-ctx.Done():
+			break serve
+		case err = <-serveErr:
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			break serve
+		case <-reloads:
+			if reloadErr := env.Update(); reloadErr != nil {
+				// Dotenv parser errors can include secret values.
+				slog.ErrorContext(ctx, "Environment reload failed; keeping active configuration", "error_type", fmt.Sprintf("%T", reloadErr))
+				continue
+			}
+			cfg.Update(ctx)
+			next, reloadErr := api.LoadSettings(cfg)
+			if reloadErr == nil && next.Address != s.Address {
+				reloadErr = errors.New("listen address changes require a restart")
+			}
+			if reloadErr != nil {
+				slog.ErrorContext(ctx, "Configuration reload failed; keeping active configuration", common.ErrAttr(reloadErr))
+				continue
+			}
+			replacement, reloadErr := newAuthorizerState(ctx, next, state)
+			if reloadErr != nil {
+				slog.ErrorContext(ctx, "Configuration reload failed; keeping active configuration", common.ErrAttr(reloadErr))
+				continue
+			}
+			previous := state
+			state = replacement
+			active.Store(state)
+			s = next
+			stage = cfg.Get(common.StageKey).Value()
+			common.SetupLogs(stage, config.AsBool(cfg.Get(common.VerboseKey)))
+			previous.close()
+			slog.InfoContext(ctx, "Reloaded edge sidecar configuration", "address", s.Address, "stage", stage)
 		}
 	}
 	slog.InfoContext(ctx, "Shutting down edge sidecar", common.ErrAttr(err))
-	stopJobs()
+	state.stopJobs()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
 		server.Close()
 		err = errors.Join(err, shutdownErr)
 	}
-	<-jobsDone
 	slog.InfoContext(ctx, "Edge sidecar stopped", common.ErrAttr(err))
 	return err
 }
@@ -111,13 +188,10 @@ func start(envFile string) error {
 		value, _ := env.GetEx(name)
 		return value
 	})
-	stage := cfg.Get(common.StageKey).Value()
-	common.SetupLogs(stage, config.AsBool(cfg.Get(common.VerboseKey)))
-	s, err := api.LoadSettings(cfg)
-	if err != nil {
-		return err
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return run(common.TraceContext(ctx, api.ServiceName), s, stage)
+	reloads := make(chan os.Signal, 1)
+	signal.Notify(reloads, syscall.SIGHUP)
+	defer signal.Stop(reloads)
+	return run(common.TraceContext(ctx, api.ServiceName), env, cfg, reloads)
 }

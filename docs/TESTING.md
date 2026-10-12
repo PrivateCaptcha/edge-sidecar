@@ -43,8 +43,9 @@ The default and CI continue to use Playwright's bundled Chromium. See
 The core suite checks a real hosted captcha solve, completion and cookie
 attributes, reload with the original query/fragment, authorized GET/POST traffic,
 and denial after clearing the cookie. It also checks POST body/method/URI
-preservation and application-generated `401` responses. Separate HTTP tests cover
-unauthenticated requests, invalid cookies, spoofed forwarded headers, POST
+preservation, application-generated `401` responses, and WebSocket upgrade-header
+forwarding. Separate HTTP tests cover unauthenticated WebSocket upgrades and other
+requests, invalid cookies, spoofed forwarded headers, POST
 navigation detection, AJAX/htmx denial, reserved helper routes, and completion
 validation failures.
 

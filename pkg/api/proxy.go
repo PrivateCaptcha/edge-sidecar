@@ -9,11 +9,47 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/config"
 	realclientip "github.com/realclientip/realclientip-go"
 )
+
+type proxyDNSResult struct {
+	addresses []netip.Addr
+	err       error
+	expiresAt time.Time
+}
+
+type proxyDNSCache struct {
+	mu      sync.Mutex
+	entries map[string]proxyDNSResult
+	now     func() time.Time
+}
+
+func (c *proxyDNSCache) lookup(ctx context.Context, host string, lookup func(context.Context, string, string) ([]netip.Addr, error)) ([]netip.Addr, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if result, found := c.entries[host]; found && c.now().Before(result.expiresAt) {
+		return result.addresses, result.err
+	}
+	addresses, err := lookup(ctx, "ip", host)
+	if ctx.Err() == context.Canceled {
+		return addresses, err
+	}
+	ttl := proxyDNSTTL
+	if err != nil || len(addresses) == 0 {
+		ttl = proxyTimeout
+	}
+	c.entries[host] = proxyDNSResult{
+		addresses: addresses,
+		err:       err,
+		expiresAt: c.now().Add(ttl),
+	}
+	return addresses, err
+}
 
 func singleHeader(r *http.Request, name string) (string, error) {
 	values := r.Header.Values(name)
@@ -65,7 +101,7 @@ func (s Settings) requestHost(r *http.Request) (string, error) {
 		ctx, cancel := context.WithTimeout(r.Context(), proxyTimeout)
 		defer cancel()
 		for _, host := range s.trustedProxyHosts {
-			addresses, err := s.lookupProxy(ctx, "ip", host)
+			addresses, err := s.proxyDNS.lookup(ctx, host, s.lookupProxy)
 			if err != nil {
 				slog.WarnContext(ctx, "Trusted proxy hostname lookup failed", "endpoint", r.URL.Path,
 					"proxy_host", host, common.ErrAttr(err))

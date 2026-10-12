@@ -33,6 +33,7 @@ const (
 	requestTimeout = 8 * time.Second
 	fetchTimeout   = 5 * time.Second
 	proxyTimeout   = time.Second
+	proxyDNSTTL    = 10 * time.Second
 	fetchAttempts  = 3
 	gateRetryGap   = 2 * time.Second
 	maxGateTTL     = 24 * time.Hour
@@ -80,6 +81,7 @@ const (
 	reasonCrossSite         denialReason = "cross_site"
 	reasonBadClientIP       denialReason = "bad_client_ip"
 	reasonContentType       denialReason = "content_type"
+	reasonConcurrencyLimit  denialReason = "concurrency_limit"
 	reasonBodySize          denialReason = "body_size"
 	reasonBodyRead          denialReason = "body_read"
 	reasonMalformedForm     denialReason = "malformed_form"

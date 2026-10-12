@@ -24,32 +24,36 @@ const (
 	protectedOriginKey
 	trustedProxiesKey
 	trustedProxyHostsKey
+	maxConcurrentCompletionsKey
 )
 
 type Settings struct {
-	Address           string
-	jwksURL           string
-	issuer            string
-	sitekey           string
-	refreshInterval   time.Duration
-	apiBaseURL        string
-	apiKey            string
-	protectedOrigin   string
-	trustedProxies    []netip.Prefix
-	trustedProxyHosts []string
-	lookupProxy       func(context.Context, string, string) ([]netip.Addr, error)
+	Address                  string
+	jwksURL                  string
+	issuer                   string
+	sitekey                  string
+	refreshInterval          time.Duration
+	apiBaseURL               string
+	apiKey                   string
+	protectedOrigin          string
+	trustedProxies           []netip.Prefix
+	trustedProxyHosts        []string
+	lookupProxy              func(context.Context, string, string) ([]netip.Addr, error)
+	maxConcurrentCompletions int
+	proxyDNS                 *proxyDNSCache
 }
 
 func RegisterConfig() error {
 	for key, name := range map[common.ConfigKey]string{
-		jwksURLKey:             "PC_JWKS_URL",
-		issuerKey:              "PC_ISSUER",
-		sitekeyKey:             "PC_SITEKEY",
-		jwksRefreshIntervalKey: "PC_JWKS_REFRESH_INTERVAL",
-		apiKeyKey:              "PC_API_KEY",
-		protectedOriginKey:     "PC_PROTECTED_ORIGIN",
-		trustedProxiesKey:      "PC_TRUSTED_PROXY_CIDRS",
-		trustedProxyHostsKey:   "PC_TRUSTED_PROXY_HOSTS",
+		jwksURLKey:                  "PC_JWKS_URL",
+		issuerKey:                   "PC_ISSUER",
+		sitekeyKey:                  "PC_SITEKEY",
+		jwksRefreshIntervalKey:      "PC_JWKS_REFRESH_INTERVAL",
+		apiKeyKey:                   "PC_API_KEY",
+		protectedOriginKey:          "PC_PROTECTED_ORIGIN",
+		trustedProxiesKey:           "PC_TRUSTED_PROXY_CIDRS",
+		trustedProxyHostsKey:        "PC_TRUSTED_PROXY_HOSTS",
+		maxConcurrentCompletionsKey: "PC_MAX_CONCURRENT_COMPLETIONS",
 	} {
 		if err := config.RegisterEnvNameForConfigKey(key, name); err != nil {
 			return err
@@ -69,15 +73,20 @@ func LoadSettings(cfg common.ConfigStore) (Settings, error) {
 	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return Settings{}, errors.New("PC_PORT must be a port between 1 and 65535")
 	}
+	maxCompletions, err := strconv.Atoi(value(maxConcurrentCompletionsKey, "512"))
+	if err != nil || maxCompletions < 1 {
+		return Settings{}, errors.New("PC_MAX_CONCURRENT_COMPLETIONS must be a positive integer")
+	}
 	s := Settings{
-		Address:         net.JoinHostPort(value(common.HostKey, "localhost"), port),
-		jwksURL:         value(jwksURLKey, "https://api.privatecaptcha.com"+jwksPath),
-		issuer:          value(issuerKey, "https://api.privatecaptcha.com"),
-		sitekey:         value(sitekeyKey, ""),
-		refreshInterval: 5 * time.Minute,
-		apiBaseURL:      strings.TrimRight(value(common.APIBaseURLKey, "https://api.privatecaptcha.com"), "/"),
-		apiKey:          value(apiKeyKey, ""),
-		lookupProxy:     net.DefaultResolver.LookupNetIP,
+		Address:                  net.JoinHostPort(value(common.HostKey, "localhost"), port),
+		jwksURL:                  value(jwksURLKey, "https://api.privatecaptcha.com"+jwksPath),
+		issuer:                   value(issuerKey, "https://api.privatecaptcha.com"),
+		sitekey:                  value(sitekeyKey, ""),
+		refreshInterval:          5 * time.Minute,
+		apiBaseURL:               strings.TrimRight(value(common.APIBaseURLKey, "https://api.privatecaptcha.com"), "/"),
+		apiKey:                   value(apiKeyKey, ""),
+		lookupProxy:              net.DefaultResolver.LookupNetIP,
+		maxConcurrentCompletions: maxCompletions,
 	}
 	if s.sitekey == "" || len(s.sitekey) > 128 || strings.ContainsAny(s.sitekey, " \t\r\n") {
 		return Settings{}, errors.New("PC_SITEKEY must be a nonempty sitekey")
@@ -111,7 +120,6 @@ func LoadSettings(cfg common.ConfigStore) (Settings, error) {
 	if s.apiKey == "" || len(s.apiKey) > 4096 || strings.TrimSpace(s.apiKey) != s.apiKey || strings.ContainsAny(s.apiKey, "\r\n") {
 		return Settings{}, errors.New("PC_API_KEY must be a nonempty valid API key")
 	}
-	var err error
 	s.protectedOrigin, _, err = normalizeOrigin(value(protectedOriginKey, ""))
 	if err != nil {
 		return Settings{}, errors.New("PC_PROTECTED_ORIGIN must be an HTTPS origin without a path, query, or fragment")

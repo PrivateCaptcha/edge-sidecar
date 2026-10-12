@@ -23,6 +23,9 @@ The original method is saved before the auth check because an
 can change POST to GET. Auth requests omit the body and `Content-Length`, while
 authorized application requests retain their method, URI, and body. Application
 errors pass through without invoking the gate, and completion is never retried.
+WebSocket upgrade headers are forwarded to the application after authorization;
+the auth subrequests remain ordinary HTTP requests. Configure application ping
+frames or `proxy_read_timeout` for WebSockets that can remain idle for over 60s.
 
 nginx overwrites the forwarded metadata and client IP. Keep the sidecar private
 and set `PC_TRUSTED_PROXY_HOSTS=nginx` in Docker, or configure its actual peer CIDRs.

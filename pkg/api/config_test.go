@@ -19,12 +19,59 @@ func TestEdgeSidecarConfig(t *testing.T) {
 		{"PC_TRUSTED_PROXY_CIDRS", ""},
 		{"PC_TRUSTED_PROXY_CIDRS", "not-an-IP"},
 		{"PC_API_BASE_URL", "http://example.com"},
+		{
+			name:  "PC_MAX_CONCURRENT_COMPLETIONS",
+			value: "0",
+		},
+		{
+			name:  "PC_MAX_CONCURRENT_COMPLETIONS",
+			value: "-1",
+		},
+		{
+			name:  "PC_MAX_CONCURRENT_COMPLETIONS",
+			value: "invalid",
+		},
+		{
+			name:  "PC_MAX_CONCURRENT_COMPLETIONS",
+			value: "999999999999999999999999",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testEnv()
 			env[tc.name] = tc.value
 			if _, err := LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] })); err == nil {
 				t.Fatal("invalid configuration accepted")
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarConfigCompletionConcurrency(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  int
+	}{
+		{
+			name:  "Default",
+			value: "",
+			want:  512,
+		},
+		{
+			name:  "Configured",
+			value: "7",
+			want:  7,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv()
+			env["PC_MAX_CONCURRENT_COMPLETIONS"] = tc.value
+			s, err := LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.maxConcurrentCompletions != tc.want {
+				t.Fatalf("concurrency=%d want=%d", s.maxConcurrentCompletions, tc.want)
 			}
 		})
 	}

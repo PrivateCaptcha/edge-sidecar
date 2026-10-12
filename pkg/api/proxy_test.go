@@ -18,9 +18,13 @@ func TestEdgeSidecarProxyServiceName(t *testing.T) {
 	f := newEdgeFixture(t)
 	f.a.s.trustedProxies = nil
 	f.a.s.trustedProxyHosts = []string{"caddy"}
+	now := time.Now()
+	f.a.s.proxyDNS.now = func() time.Time { return now }
 	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("2001:db8::10")}
 	var lookupErr error
+	var lookups atomic.Int32
 	f.a.s.lookupProxy = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		lookups.Add(1)
 		if network != "ip" || host != "caddy" {
 			t.Fatal("proxy lookup did not use the fixed configured service name")
 		}
@@ -44,15 +48,57 @@ func TestEdgeSidecarProxyServiceName(t *testing.T) {
 	authorize("192.0.2.10:8080", 204)
 	authorize("[2001:db8::10]:8080", 204)
 	authorize("192.0.2.11:8080", 401)
+	for i := 0; i < 100; i++ {
+		authorize("192.0.2.10:8080", 204)
+	}
+	if lookups.Load() != 1 {
+		t.Fatalf("warm authorization performed %d DNS lookups", lookups.Load())
+	}
 
 	addresses = []netip.Addr{netip.MustParseAddr("192.0.2.20")}
+	authorize("192.0.2.10:8080", 204)
+	authorize("192.0.2.20:8080", 401)
+	now = now.Add(proxyDNSTTL)
 	authorize("192.0.2.20:8080", 204)
 	authorize("192.0.2.10:8080", 401)
 	lookupErr = errors.New("DNS unavailable")
+	now = now.Add(proxyDNSTTL)
 	authorize("192.0.2.20:8080", 401)
+	authorize("192.0.2.20:8080", 401)
+	if lookups.Load() != 3 {
+		t.Fatal("DNS errors were not briefly cached")
+	}
 	lookupErr = nil
+	now = now.Add(proxyTimeout)
+	authorize("192.0.2.20:8080", 204)
 	addresses = nil
+	now = now.Add(proxyDNSTTL)
 	authorize("192.0.2.20:8080", 401)
+}
+
+func TestEdgeSidecarProxyCanceledLookup(t *testing.T) {
+	f := newEdgeFixture(t)
+	f.a.s.trustedProxies = nil
+	f.a.s.trustedProxyHosts = []string{"caddy"}
+	var calls atomic.Int32
+	f.a.s.lookupProxy = func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+		if calls.Add(1) == 1 {
+			return nil, ctx.Err()
+		}
+		return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	r := authRequest(f.token(t, nil, nil)).WithContext(ctx)
+	r.RemoteAddr = "192.0.2.10:8080"
+	f.a.auth(httptest.NewRecorder(), r)
+	r = authRequest(f.token(t, nil, nil))
+	r.RemoteAddr = "192.0.2.10:8080"
+	w := httptest.NewRecorder()
+	f.a.auth(w, r)
+	if w.Code != http.StatusNoContent || calls.Load() != 2 {
+		t.Fatal("canceled lookup poisoned the proxy DNS cache")
+	}
 }
 
 func TestEdgeSidecarProxyServiceNameCompletion(t *testing.T) {

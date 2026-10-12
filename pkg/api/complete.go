@@ -72,6 +72,12 @@ func (a *Authorizer) complete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
+	if !a.completionLimit.acquire() {
+		w.Header().Set(HeaderRetryAfter, "1")
+		deny(w, r, http.StatusTooManyRequests, reasonConcurrencyLimit)
+		return
+	}
+	defer a.completionLimit.release()
 	slog.Log(r.Context(), common.LevelTrace, "Captcha completion passed rate limit", "endpoint", completePath)
 	if r.ContentLength > maxFormBytes {
 		deny(w, r, http.StatusRequestEntityTooLarge, reasonBodySize)

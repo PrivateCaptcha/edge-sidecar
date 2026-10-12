@@ -1,3 +1,8 @@
+map $http_upgrade $pc_connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
 upstream privatecaptcha_authorizer {
     server ${PC_AUTH_UPSTREAM};
 }
@@ -56,6 +61,9 @@ server {
         auth_request /__privatecaptcha/auth;
         error_page 401 = /__privatecaptcha/gate;
         proxy_intercept_errors off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $pc_connection_upgrade;
         proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;

@@ -78,6 +78,18 @@ test('solving the hosted challenge authorizes the original URL and subsequent re
   expect(echo.headers()['x-demo-uri']).toBe(echoPath);
   expect(await echo.text()).toBe(echoBody);
 
+  const upgrade = await context.request.get('/private?demo=websocket-upgrade', {
+    headers: {
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Version': '13',
+      'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+    },
+  });
+  expect(upgrade.status()).toBe(200);
+  expect(upgrade.headers()['x-demo-upgrade']).toBe('websocket');
+  expect(upgrade.headers()['x-demo-connection'].toLowerCase()).toContain('upgrade');
+
   const applicationDenial = await context.request.get('/unauthorized', {
     headers: {
       Accept: 'text/html',
@@ -117,6 +129,20 @@ test('an invalid edge cookie does not authorize application access', async ({ re
   expect(response.status()).toBe(401);
   expect(response.headers()['cache-control']).toBe('no-store');
   expect(response.headers()['set-cookie']).toBeUndefined();
+  expect(await response.body()).toHaveLength(0);
+});
+
+test('unauthenticated WebSocket upgrades are denied without gate HTML', async ({ request }) => {
+  const response = await request.get('/private?demo=websocket-denial', {
+    headers: {
+      Connection: 'Upgrade',
+      Upgrade: 'websocket',
+      'Sec-WebSocket-Version': '13',
+      'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+    },
+  });
+  expect(response.status()).toBe(401);
+  expect(response.headers()['cache-control']).toBe('no-store');
   expect(await response.body()).toHaveLength(0);
 });
 

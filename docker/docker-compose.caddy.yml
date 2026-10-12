@@ -18,6 +18,7 @@ services:
       PC_JWKS_URL: ${PC_JWKS_URL:-https://api.privatecaptcha.com/.well-known/jwks.json}
       PC_PROTECTED_ORIGIN: https://${PC_EDGE_HOST:-edge.privatecaptcha.test}:${PC_EDGE_PORT:-8443}
       PC_TRUSTED_PROXY_HOSTS: caddy
+      PC_MAX_CONCURRENT_COMPLETIONS: ${PC_MAX_CONCURRENT_COMPLETIONS:-512}
     restart: unless-stopped
     stop_grace_period: 15s
 

@@ -58,7 +58,12 @@ See [TESTING.md](docs/TESTING.md) for Docker setup.
 ## Configuration
 
 Uses the shared [environment configuration](../../pkg/config/env.go). `-env FILE`
-or `-env stdin` loads dotenv values; restart to apply configuration changes.
+or `-env stdin` loads dotenv values. Send SIGHUP (`kill -HUP PID`) to reread a
+dotenv file and apply validated settings to new requests. Failed reloads keep the
+active configuration, and in-flight requests finish with their previous settings.
+Changing `PC_HOST` or `PC_PORT` requires a restart. Values loaded from stdin remain
+fixed at startup. systemd `LoadCredential` files are activation-time snapshots;
+restart the service to refresh those credentials.
 
 | Setting | Default / requirement |
 | --- | --- |
@@ -70,6 +75,7 @@ or `-env stdin` loads dotenv values; restart to apply configuration changes.
 | `PC_ISSUER` | `https://api.privatecaptcha.com`; exact JWT issuer. |
 | `PC_JWKS_URL` | `https://api.privatecaptcha.com/.well-known/jwks.json`; fixed URL, no redirects. |
 | `PC_JWKS_REFRESH_INTERVAL` | `5m`; Go duration between `1s` and `24h`. |
+| `PC_MAX_CONCURRENT_COMPLETIONS` | `512`; positive integer limiting concurrent completions per process. Saturation returns `429` with `Retry-After` before reading the form. |
 | `PC_HOST`, `PC_PORT` | `localhost`, `8080`; demo binds privately on `0.0.0.0`. |
 | `STAGE`, `PC_VERBOSE` | Shared logging settings. |
 
@@ -91,6 +97,8 @@ Proxy headers describe the request; they do not authenticate the caller.
 Keep the sidecar private and trust only configured proxy peers. `X-Forwarded-For`
 identifies a browser IP, not the socket peer; the completion limiter uses the
 proxy's overwritten `X-PC-Client-IP` instead.
+Trusted proxy DNS results are cached for 10 seconds; expired results are never
+used after a failed lookup. Reloading clears this cache.
 
 Current tokens use ES256, `typ=pc-edge+jwt`, `v=1`, `aud=<sitekey>`, and a signed
 `host` claim. Scheme/port are enforced separately through the configured origin.

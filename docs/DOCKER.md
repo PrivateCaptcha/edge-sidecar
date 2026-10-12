@@ -99,10 +99,15 @@ of HTML. Use a fresh browser context to repeat the no-cookie test.
 Compose creates its default network and assigns container addresses automatically.
 There are no configured subnets or static container IPs. The sidecar uses
 `PC_TRUSTED_PROXY_HOSTS=caddy` or `nginx`, resolves that Compose service name, and
-compares the result with the actual connection peer. It resolves on each request
-so the proxy can be recreated with a different address; DNS failure denies access.
+compares the result with the actual connection peer. Successful DNS results are
+cached for 10 seconds, so recreated proxy addresses are picked
+up within 10 seconds. Expired addresses are never used on DNS failure; failures
+and empty results are cached for one second. SIGHUP reloads clear the DNS cache.
 The sidecar has no published host port. The demo HTTPS and Caddy admin ports are
 published on host loopback only.
+
+`PC_MAX_CONCURRENT_COMPLETIONS` defaults to `512` and is passed to the sidecar by
+both demos. Excess completions receive `429` without contacting the API.
 
 If updating from the static-network sample, recreate this demo without deleting
 its certificate volumes:

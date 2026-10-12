@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -179,5 +180,82 @@ func TestEdgeSidecarCompletionRateLimit(t *testing.T) {
 	}
 	if calls.Load() != 10 {
 		t.Fatal("rate-limited request reached API")
+	}
+	reconfigured, err := f.a.Reconfigure(f.s, f.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	reconfigured.complete(w, completionRequest(proofForm(fixtureProof)))
+	if w.Code != http.StatusTooManyRequests || calls.Load() != 10 {
+		t.Fatal("configuration reload reset the per-IP rate limit")
+	}
+}
+
+func TestEdgeSidecarCompletionConcurrency(t *testing.T) {
+	f := newEdgeFixture(t)
+	f.s.maxConcurrentCompletions = 2
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{}, 2)
+	defer close(release)
+	var calls atomic.Int32
+	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		w.Header().Set(common.HeaderContentType, common.ContentTypeJSON)
+		io.WriteString(w, `{"success":false}`)
+	}))
+	done := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		r := completionRequest(proofForm(fixtureProof))
+		r.Header.Set(common.HeaderClientIP, fmt.Sprintf("2001:db8::%d", i+1))
+		go func() {
+			w := httptest.NewRecorder()
+			f.a.complete(w, r)
+			done <- w
+		}()
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("completion did not reach the verification API")
+		}
+	}
+	updated := f.s
+	updated.maxConcurrentCompletions = 1
+	reconfigured, err := f.a.Reconfigure(updated, f.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	r := completionRequest("")
+	r.Header.Set(common.HeaderClientIP, "2001:db8::3")
+	reconfigured.complete(w, r)
+	if w.Code != http.StatusTooManyRequests || w.Header().Get(HeaderRetryAfter) == "" || len(w.Result().Cookies()) != 0 || calls.Load() != 2 {
+		t.Fatalf("excess completion was not rejected before reading its form: status=%d calls=%d", w.Code, calls.Load())
+	}
+	allowed := httptest.NewRecorder()
+	f.a.auth(allowed, authRequest(f.token(t, nil, nil)))
+	if allowed.Code != http.StatusNoContent {
+		t.Fatal("completion saturation blocked local authorization")
+	}
+	for i := 0; i < 2; i++ {
+		release <- struct{}{}
+		if result := <-done; result.Code != http.StatusUnauthorized {
+			t.Fatalf("verification failure returned %d", result.Code)
+		}
+		if i == 0 {
+			blocked := httptest.NewRecorder()
+			reconfigured.complete(blocked, completionRequest(""))
+			if blocked.Code != http.StatusTooManyRequests {
+				t.Fatal("reload did not account for completions still using the old configuration")
+			}
+		}
+	}
+	release <- struct{}{}
+	recovered := httptest.NewRecorder()
+	reconfigured.complete(recovered, completionRequest(proofForm(fixtureProof)))
+	if recovered.Code != http.StatusUnauthorized || calls.Load() != 3 {
+		t.Fatal("finished completions did not release their concurrency slots")
 	}
 }

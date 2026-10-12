@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -297,6 +299,60 @@ func TestEdgeSidecarGateConcurrent(t *testing.T) {
 	wg.Wait()
 	if calls.Load() != 1 {
 		t.Fatal("gate requests were not coalesced")
+	}
+}
+
+func TestEdgeSidecarGateCanceledCaller(t *testing.T) {
+	f := newEdgeFixture(t)
+	body, csp := hostedGate(t, f.s.sitekey)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	defer close(release)
+	var calls atomic.Int32
+	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		entered <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-release:
+		}
+		w.Header().Set(common.HeaderContentType, common.ContentTypeHTML)
+		w.Header().Set(common.HeaderContentSecurityPolicy, csp)
+		w.Header().Set(common.HeaderCacheControl, "max-age=300")
+		w.Write(body)
+	}))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.a.gates.get(ctx)
+		done <- err
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller waited for the shared fetch")
+	}
+	healthyDone := make(chan error, 1)
+	go func() {
+		page, err := f.a.gates.get(t.Context())
+		if err == nil && !bytes.Equal(page.body, body) {
+			err = errors.New("shared fetch returned an incorrect body")
+		}
+		healthyDone <- err
+	}()
+	release <- struct{}{}
+	if err := <-healthyDone; err != nil {
+		t.Fatalf("healthy caller lost its challenge: %v", err)
+	}
+	if _, err := f.a.gates.get(t.Context()); err != nil || calls.Load() != 1 {
+		t.Fatalf("canceled caller poisoned the cache: calls=%d error=%v", calls.Load(), err)
 	}
 }
 

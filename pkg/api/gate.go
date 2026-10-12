@@ -50,29 +50,32 @@ func (c *gateCache) get(ctx context.Context) (*gatePage, error) {
 		slog.Log(ctx, common.LevelTrace, "Using cached hosted gate", "expires_at", page.expiresAt)
 		return page, nil
 	}
-	if flight := c.flight; flight != nil {
-		c.mu.Unlock()
-		slog.Log(ctx, common.LevelTrace, "Waiting for in-flight hosted gate fetch")
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-flight.done:
-			return flight.page, flight.err
-		}
-	}
-	if now.Before(c.retryAfter) {
+	flight := c.flight
+	if flight == nil && now.Before(c.retryAfter) {
 		retryAfter := c.retryAfter
 		c.mu.Unlock()
 		slog.DebugContext(ctx, "Hosted gate fetch is in retry cooldown", "retry_after", retryAfter)
 		return nil, errGateUnavailable
 	}
-	flight := &gateFlight{
-		done: make(chan struct{}),
+	if flight == nil {
+		flight = &gateFlight{
+			done: make(chan struct{}),
+		}
+		c.flight = flight
+		go c.load(context.WithoutCancel(ctx), c.entry, flight)
 	}
-	c.flight = flight
-	previous := c.entry
 	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-flight.done:
+		return flight.page, flight.err
+	}
+}
 
+func (c *gateCache) load(ctx context.Context, previous *gatePage, flight *gateFlight) {
+	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
 	page, err := c.fetch(ctx, previous)
 	c.mu.Lock()
 	if err != nil {
@@ -88,7 +91,6 @@ func (c *gateCache) get(ctx context.Context) (*gatePage, error) {
 	c.flight = nil
 	close(flight.done)
 	c.mu.Unlock()
-	return page, err
 }
 
 func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, error) {

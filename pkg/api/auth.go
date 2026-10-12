@@ -35,11 +35,21 @@ type Authorizer struct {
 	keys            *KeyCache
 	parser          *jwt.Parser
 	limitedComplete http.Handler
+	rateLimiter     ratelimit.HTTPRateLimiter
 	gates           *gateCache
 	verifier        *pc.Client
+	completionLimit *completionLimiter
 }
 
 func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
+	return newAuthorizer(s, keys, nil, nil)
+}
+
+func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimiter, rateLimiter ratelimit.HTTPRateLimiter) (*Authorizer, error) {
+	s.proxyDNS = &proxyDNSCache{
+		entries: make(map[string]proxyDNSResult, len(s.trustedProxyHosts)),
+		now:     time.Now,
+	}
 	client := *keys.client
 	client.Transport = verificationTransport{
 		RoundTripper: keys.client.Transport,
@@ -52,10 +62,20 @@ func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
 	if err != nil {
 		return nil, err
 	}
+	if completionLimit == nil {
+		completionLimit = &completionLimiter{
+			limit: s.maxConcurrentCompletions,
+		}
+	}
+	if rateLimiter == nil {
+		rateLimiter = ratelimit.NewIPAddrRateLimiter(common.HeaderClientIP, ratelimit.NewIPAddrBuckets(10_000, 10, 6*time.Second))
+	}
 	a := &Authorizer{
-		s:        s,
-		keys:     keys,
-		verifier: verifier,
+		s:               s,
+		keys:            keys,
+		verifier:        verifier,
+		completionLimit: completionLimit,
+		rateLimiter:     rateLimiter,
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{keyAlgorithm}),
 			jwt.WithIssuer(s.issuer),
@@ -65,16 +85,26 @@ func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
 			jwt.WithStrictDecoding(),
 		),
 	}
-	limiter := ratelimit.NewIPAddrRateLimiter(common.HeaderClientIP, ratelimit.NewIPAddrBuckets(10_000, 10, 6*time.Second))
-	a.limitedComplete = limiter.RateLimit(http.HandlerFunc(a.completeSolution))
+	a.limitedComplete = a.rateLimiter.RateLimit(http.HandlerFunc(a.completeSolution))
 	a.gates = &gateCache{
 		url:    s.apiBaseURL + gatePath + "?" + common.ParamSiteKey + "=" + url.QueryEscape(s.sitekey),
 		client: keys.client,
 		now:    time.Now,
 	}
 	slog.Debug("Configured edge authorizer", "protected_origin", s.protectedOrigin,
-		"trusted_proxy_cidrs", s.trustedProxies, "trusted_proxy_hosts", s.trustedProxyHosts)
+		"trusted_proxy_cidrs", s.trustedProxies, "trusted_proxy_hosts", s.trustedProxyHosts,
+		"max_concurrent_completions", s.maxConcurrentCompletions)
 	return a, nil
+}
+
+// Reconfigure builds a replacement while retaining admission limits for in-flight requests.
+func (a *Authorizer) Reconfigure(s Settings, keys *KeyCache) (*Authorizer, error) {
+	next, err := newAuthorizer(s, keys, a.completionLimit, a.rateLimiter)
+	if err != nil {
+		return nil, err
+	}
+	next.completionLimit.setLimit(s.maxConcurrentCompletions)
+	return next, nil
 }
 
 func (a *Authorizer) Setup(router *http.ServeMux) {
