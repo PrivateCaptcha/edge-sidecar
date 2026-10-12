@@ -10,21 +10,43 @@ make test-unit
 
 The Playwright suite requires Node.js 22+ and the running
 [Docker demo](./DOCKER.md), configured with a real property and API key.
-The test machine must resolve the property's hostname to the Caddy host.
+The test machine must resolve the property's hostname to the proxy host.
 
 ```sh
 make setup-e2e
 make test-e2e
 ```
 
+The same `e2e/edge-sidecar.spec.js` runs against both demos. With nginx running:
+
+```sh
+make test-e2e EDGE_PROXY=nginx
+```
+
+`EDGE_PROXY` selects Docker tooling; tests use the configured origin. Run one demo
+at a time, or set `E2E_BASE_URL` to the specific running demo you want to test.
+
 The runner reads `PC_EDGE_HOST` and `PC_EDGE_PORT` from `docker/.env` by default.
 `EDGE_DOCKER_ENV` selects another env file, and `E2E_BASE_URL` overrides the test
-origin. The local Caddy CA is accepted by the test browser and HTTP client.
+origin. Both demos' local TLS certificates are accepted by the test browser and
+HTTP client.
+
+To use an already installed Google Chrome for local tests:
+
+```sh
+E2E_BROWSER_CHANNEL=chrome make test-e2e EDGE_PROXY=nginx
+```
+
+The default and CI continue to use Playwright's bundled Chromium. See
+[browser channels](https://playwright.dev/docs/browsers#google-chrome--microsoft-edge).
 
 The core suite checks a real hosted captcha solve, completion and cookie
 attributes, reload with the original query/fragment, authorized GET/POST traffic,
-and denial after clearing the cookie. Separate HTTP tests cover unauthenticated
-requests, invalid cookies, and key completion validation failures.
+and denial after clearing the cookie. It also checks POST body/method/URI
+preservation and application-generated `401` responses. Separate HTTP tests cover
+unauthenticated requests, invalid cookies, spoofed forwarded headers, POST
+navigation detection, AJAX/htmx denial, reserved helper routes, and completion
+validation failures.
 
 For Linux CI, install Chromium's system dependencies during setup:
 
@@ -38,9 +60,11 @@ options through `EXTRA_E2E_FLAGS`, for example `make test-e2e EXTRA_E2E_FLAGS=--
 The HTML report is written to `playwright-report/`, with failure traces in
 `test-results/`.
 
-The E2E job in `.github/workflows/ci.yml` builds and starts the Docker demo, waits
-for the sidecar, runs the suite, and stops the stack. Failures include container
-logs and downloadable Playwright artifacts.
+The E2E matrix in `.github/workflows/ci.yml` validates, builds, and starts each
+Docker demo independently. Compose stays attached and blocking while the test
+runner waits for readiness and runs the same suite alongside it, then stops the
+stack. Container logs stream directly into the job; failures also include
+proxy-specific Playwright artifacts.
 
 Configure these GitHub Actions repository settings:
 

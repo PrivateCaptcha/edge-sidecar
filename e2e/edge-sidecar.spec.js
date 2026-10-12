@@ -54,8 +54,40 @@ test('solving the hosted challenge authorizes the original URL and subsequent re
       data: method === 'POST' ? 'marker=playwright' : undefined,
     });
     expect(response.status()).toBe(200);
+    expect(response.headers()['x-demo-method']).toBe(method);
+    expect(response.headers()['x-demo-uri']).toBe('/private?demo=playwright-authorized');
+    expect(response.headers()['x-demo-host']).toBe(protectedURL.host);
     expect(await response.text()).toBe(applicationText);
   }
+
+  const echoPath = '/echo?return=%2Faccount&demo=playwright';
+  const echoBody = 'marker=playwright&value=original-post-body';
+  const echo = await context.request.post(echoPath, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'X-Forwarded-Host': 'attacker.example',
+      'X-Forwarded-Proto': 'http',
+      'X-Forwarded-Method': 'DELETE',
+      'X-Forwarded-Uri': '/forged',
+      'X-PC-Client-IP': 'invalid',
+    },
+    data: echoBody,
+  });
+  expect(echo.status()).toBe(200);
+  expect(echo.headers()['x-demo-method']).toBe('POST');
+  expect(echo.headers()['x-demo-uri']).toBe(echoPath);
+  expect(await echo.text()).toBe(echoBody);
+
+  const applicationDenial = await context.request.get('/unauthorized', {
+    headers: {
+      Accept: 'text/html',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document',
+    },
+  });
+  expect(applicationDenial.status()).toBe(401);
+  expect(applicationDenial.headers()['content-type']).toBe('text/plain; charset=utf-8');
+  expect(await applicationDenial.text()).toBe('PrivateCaptcha edge demo: application unauthorized.');
 
   await context.clearCookies();
   const denied = await page.reload();
@@ -69,6 +101,7 @@ test('non-navigation requests without a cookie are denied without gate HTML', as
     const response = await request.fetch('/private', {
       method,
       headers: { Accept: 'application/json' },
+      data: method === 'POST' ? 'marker=unauthorized' : undefined,
     });
     expect(response.status()).toBe(401);
     expect(response.headers()['cache-control']).toBe('no-store');
@@ -87,11 +120,76 @@ test('an invalid edge cookie does not authorize application access', async ({ re
   expect(await response.body()).toHaveLength(0);
 });
 
+test('an unauthenticated POST never becomes a GET navigation challenge', async ({ request }) => {
+  const response = await request.post('/private?demo=post-navigation', {
+    headers: {
+      Accept: 'text/html',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document',
+      'X-Forwarded-Method': 'GET',
+    },
+    data: 'marker=unauthorized',
+  });
+  expect(response.status()).toBe(401);
+  expect(response.headers()['cache-control']).toBe('no-store');
+  expect(response.headers()['set-cookie']).toBeUndefined();
+  expect(await response.body()).toHaveLength(0);
+});
+
+test('browser navigation uses proxy metadata instead of spoofed forwarded headers', async ({ request }) => {
+  const response = await request.get('/private?demo=spoofed-headers', {
+    headers: {
+      Accept: 'text/html',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Dest': 'document',
+      'X-Forwarded-Host': 'attacker.example',
+      'X-Forwarded-Proto': 'http',
+      'X-Forwarded-Method': 'POST',
+      'X-Forwarded-Uri': '/forged',
+      'X-PC-Client-IP': 'invalid',
+    },
+  });
+  expect(response.status()).toBe(401);
+  expect(response.headers()['cache-control']).toBe('no-store');
+  expect(response.headers()['content-security-policy']).toBeTruthy();
+  expect(response.headers()['set-cookie']).toBeUndefined();
+  expect(await response.text()).toContain('id="gate-form"');
+});
+
+test('AJAX and htmx requests do not receive gate HTML', async ({ request }) => {
+  for (const headers of [
+    { 'X-Requested-With': 'XMLHttpRequest' },
+    { 'HX-Request': 'true' },
+  ]) {
+    const response = await request.get('/private', {
+      headers: { Accept: 'text/html', ...headers },
+    });
+    expect(response.status()).toBe(401);
+    expect(response.headers()['cache-control']).toBe('no-store');
+    expect(await response.body()).toHaveLength(0);
+  }
+});
+
+test('auth helpers and unknown reserved routes are not public endpoints', async ({ request }) => {
+  for (const path of ['/__privatecaptcha/auth', '/__privatecaptcha/gate', '/__privatecaptcha/unknown']) {
+    const response = await request.get(path);
+    expect(response.status()).toBe(404);
+    expect(response.headers()['set-cookie']).toBeUndefined();
+    expect(await response.text()).not.toContain(applicationText);
+  }
+});
+
 for (const { name, status, headers } of [
   { name: 'missing Origin', status: 403, headers: () => ({}) },
   { name: 'cross-origin submission', status: 403, headers: () => ({ Origin: 'https://attacker.example' }) },
   { name: 'unsupported content type', status: 415, headers: origin => ({ Origin: origin, 'Content-Type': 'application/json' }) },
   { name: 'empty proof', status: 400, headers: origin => ({ Origin: origin }) },
+  { name: 'spoofed proxy headers', status: 400, headers: origin => ({
+    Origin: origin,
+    'X-Forwarded-Host': 'attacker.example',
+    'X-Forwarded-Proto': 'http',
+    'X-PC-Client-IP': 'invalid',
+  }) },
 ]) {
   test(`completion rejects ${name} without issuing a cookie`, async ({ request, baseURL }) => {
     const response = await request.post(completePath, {

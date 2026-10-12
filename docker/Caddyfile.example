@@ -11,6 +11,10 @@
 		}
 	}
 
+	handle /__privatecaptcha/* {
+		respond 404
+	}
+
 	handle {
 		forward_auth {$PC_AUTH_UPSTREAM:privatecaptcha-authorizer:8080} {
 			uri /auth

@@ -7,8 +7,6 @@ on:
     paths-ignore:
     - 'docs/**'
     - '**.md'
-    - 'docker-compose.yml'
-    - 'Dockerfile'
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
@@ -38,11 +36,17 @@ jobs:
       run: make test-unit
 
   e2e:
+    name: E2E (${{ matrix.proxy }})
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        proxy: [caddy, nginx]
     env:
+      EDGE_PROXY: ${{ matrix.proxy }}
       PC_SITEKEY: ${{ secrets.PC_SITEKEY }}
       PC_API_KEY: ${{ secrets.PC_API_KEY }}
       PC_EDGE_HOST: ${{ vars.PC_EDGE_HOST || 'edge.privatecaptcha.test' }}
@@ -70,34 +74,37 @@ jobs:
     - name: Resolve the test hostname
       run: printf '127.0.0.1 %s\n' "$PC_EDGE_HOST" | sudo tee -a /etc/hosts
 
-    - name: Start the demo stack
-      run: make run-edge-docker EDGE_DOCKER_FLAGS="--wait --wait-timeout 120"
-
-    - name: Wait for the sidecar
+    - name: Run the demo and E2E tests
       run: |
-        for attempt in {1..60}; do
-          if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
-            --output /dev/null --write-out '%{http_code}' \
-            "https://${PC_EDGE_HOST}:${PC_EDGE_PORT}/private") && [ "$status" = '401' ]; then
-            exit 0
+        make validate-edge-docker
+        (
+          trap 'make stop-edge-docker' EXIT
+          ready=false
+          for attempt in {1..60}; do
+            if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
+              --output /dev/null --write-out '%{http_code}' \
+              "https://${PC_EDGE_HOST}:${PC_EDGE_PORT}/private") && [ "$status" = '401' ]; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            printf 'Sidecar was not ready after %s attempts (HTTP %s)\n' "$attempt" "$status" >&2
+            exit 1
           fi
-          sleep 1
-        done
-        printf 'Sidecar was not ready after %s attempts (HTTP %s)\n' "$attempt" "$status" >&2
-        exit 1
-
-    - name: Run E2E tests
-      run: make test-e2e
-
-    - name: Show container logs on failure
-      if: failure()
-      run: make logs-edge-docker EDGE_DOCKER_LOG_FLAGS=--no-color
+          make test-e2e
+        ) &
+        tests_pid=$!
+        trap 'if kill -0 "$tests_pid" 2>/dev/null; then kill "$tests_pid"; fi' EXIT
+        make run-edge-docker EDGE_DOCKER_FLAGS=--abort-on-container-exit
+        wait "$tests_pid"
 
     - name: Upload Playwright failure artifacts
       if: failure()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: playwright-report
+        name: playwright-report-${{ matrix.proxy }}
         path: |
           playwright-report/
           test-results/

@@ -17,6 +17,7 @@ module.exports = defineConfig({
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
     browserName: 'chromium',
+    channel: process.env.E2E_BROWSER_CHANNEL,
     baseURL: process.env.E2E_BASE_URL || `https://${process.env.PC_EDGE_HOST || 'edge.privatecaptcha.test'}:${process.env.PC_EDGE_PORT || '8443'}`,
     ignoreHTTPSErrors: true,
     trace: 'retain-on-failure',

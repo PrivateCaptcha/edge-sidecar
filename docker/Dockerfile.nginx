@@ -1,0 +1,4 @@
+FROM nginx:1.30.5-alpine
+
+RUN apk add --no-cache openssl
+COPY --chmod=755 docker/nginx-tls.sh /docker-entrypoint.d/15-privatecaptcha-tls.sh

@@ -1,0 +1,65 @@
+upstream privatecaptcha_authorizer {
+    server ${PC_AUTH_UPSTREAM};
+}
+
+upstream privatecaptcha_app {
+    server ${PC_APP_UPSTREAM};
+}
+
+server {
+    listen ${PC_EDGE_PORT} ssl;
+    server_name ${PC_EDGE_HOST};
+    ssl_certificate /etc/nginx/tls/server.crt;
+    ssl_certificate_key /etc/nginx/tls/server.key;
+
+    location = /__privatecaptcha/complete {
+        auth_request off;
+        client_max_body_size 1m;
+        include /etc/nginx/snippets/privatecaptcha-sidecar.conf;
+        proxy_next_upstream off;
+        proxy_pass http://privatecaptcha_authorizer;
+    }
+
+    location = /__privatecaptcha/auth {
+        internal;
+        auth_request off;
+        include /etc/nginx/snippets/privatecaptcha-sidecar.conf;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Forwarded-Method $pc_original_method;
+        proxy_set_header X-Forwarded-Uri $request_uri;
+        # auth_request discards the body, so do not prepare a challenge here.
+        proxy_set_header Accept "";
+        proxy_pass http://privatecaptcha_authorizer/auth;
+    }
+
+    location = /__privatecaptcha/gate {
+        internal;
+        auth_request off;
+        include /etc/nginx/snippets/privatecaptcha-sidecar.conf;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Forwarded-Method $pc_original_method;
+        proxy_set_header X-Forwarded-Uri $request_uri;
+        proxy_pass http://privatecaptcha_authorizer/auth;
+    }
+
+    location /__privatecaptcha/ {
+        return 404;
+    }
+
+    location / {
+        # error_page can change POST to GET; retain the method for gate detection.
+        set $pc_original_method $request_method;
+        auth_request /__privatecaptcha/auth;
+        error_page 401 = /__privatecaptcha/gate;
+        proxy_intercept_errors off;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_pass http://privatecaptcha_app;
+    }
+}

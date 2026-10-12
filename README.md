@@ -4,14 +4,17 @@
 
 [![CI](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml) [![Go Lint](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml)
 
-Caddy `forward_auth` authorization with a hosted captcha fallback. The application
-needs no changes; Caddy proxies application traffic, while the sidecar handles
-only `/auth`, `/__privatecaptcha/complete`, and `/healthz`.
+Caddy `forward_auth` and nginx `auth_request` authorization with a hosted captcha
+fallback. The application needs no changes; the web server proxies application
+traffic, while the sidecar handles only `/auth`, `/__privatecaptcha/complete`, and
+`/healthz`.
+
+Integration notes: [Caddy](docs/CADDY.md) and [nginx](docs/NGINX.md).
 
 ## Flow
 
 ```text
-Browser -> Caddy -> GET /auth
+Browser -> proxy -> GET /auth
                      |
               +------+------+
               |             |
@@ -38,6 +41,9 @@ always use `Cache-Control: no-store`. Non-navigation requests get an empty `401`
 The hosted gate owns submission/reload JavaScript and CSP. The sidecar passes
 HTML/CSP through unchanged.
 
+nginx uses a status-only auth subrequest, then a second internal `/auth` request
+on denial to return the full response at the original browser URL.
+
 ## Run
 
 ```sh
@@ -58,7 +64,7 @@ or `-env stdin` loads dotenv values; restart to apply configuration changes.
 | --- | --- |
 | `PC_SITEKEY`, `PC_API_KEY` | Required; API key belongs to the property's organization and has puzzle scope. |
 | `PC_PROTECTED_ORIGIN` | Required HTTPS origin, including a non-default port. Property domain must match. |
-| `PC_TRUSTED_PROXY_HOSTS` | Trusted internal proxy DNS names; Docker demo uses `caddy`. |
+| `PC_TRUSTED_PROXY_HOSTS` | Trusted internal proxy DNS names; Docker demos use `caddy` or `nginx`. |
 | `PC_TRUSTED_PROXY_CIDRS` | Trusted socket-peer IPs/CIDRs; configure hosts, CIDRs, or both. |
 | `PC_API_BASE_URL` | `https://api.privatecaptcha.com`; verification uses the official Go SDK. |
 | `PC_ISSUER` | `https://api.privatecaptcha.com`; exact JWT issuer. |
@@ -74,17 +80,17 @@ The property must have edge-tokens enabled. API verification uses HTTPS; loopbac
 ```text
 untrusted browser headers
          |
-    Caddy overwrites host/proto/method/URI/client-IP
+    proxy overwrites host/proto/method/URI/client-IP
          |
     sidecar checks actual proxy peer + configured origin
          |
     JWT: signature + issuer + aud=sitekey + signed hostname
 ```
 
-Caddy's headers describe the request; they do not authenticate the caller.
-Keep the sidecar private and trust only configured Caddy peers. `X-Forwarded-For`
-identifies a browser IP, not the socket peer; the completion limiter uses Caddy's
-overwritten `X-PC-Client-IP` instead.
+Proxy headers describe the request; they do not authenticate the caller.
+Keep the sidecar private and trust only configured proxy peers. `X-Forwarded-For`
+identifies a browser IP, not the socket peer; the completion limiter uses the
+proxy's overwritten `X-PC-Client-IP` instead.
 
 Current tokens use ES256, `typ=pc-edge+jwt`, `v=1`, `aud=<sitekey>`, and a signed
 `host` claim. Scheme/port are enforced separately through the configured origin.
