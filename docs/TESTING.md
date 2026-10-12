@@ -1,78 +1,67 @@
 # Testing
 
+Run commands from the repository root.
+
 ## Unit tests
 
 ```sh
 make test-unit
 ```
 
+## Docker demo
+
+Requires Docker. Both demos run a proxy, the sidecar, and a small
+application against the real PrivateCaptcha API.
+
+```sh
+make setup-edge-docker
+```
+
+Edit the ignored `docker/.env`:
+
+- Set `PC_SITEKEY` for an enabled property with edge tokens enabled, and
+  `PC_API_KEY` to its organization's API key with puzzle scope.
+- Set `PC_EDGE_HOST` to the property's domain; `PC_EDGE_PORT` defaults to `8443`.
+
+Map that hostname to `127.0.0.1` in your hosts file, for example
+`127.0.0.1 edge.privatecaptcha.test`.
+
+Caddy is the default. Replace `caddy` with `nginx` in all commands to use nginx;
+run one stack at a time because both use the same port.
+
+Start the stack in one terminal and leave it running:
+
+```sh
+make validate-edge-docker EDGE_PROXY=caddy
+make run-edge-docker EDGE_PROXY=caddy
+```
+
+For manual testing, open `https://<PC_EDGE_HOST>:<PC_EDGE_PORT>/private`.
+Caddy uses an internal CA; nginx uses a self-signed certificate. A manual browser
+needs the demo CA/certificate trusted or an exception.
+
+After editing proxy configuration, run `make reload-edge-docker EDGE_PROXY=caddy`.
+
 ## End-to-end tests
 
-The Playwright suite requires Node.js 22+ and the running
-[Docker demo](./DOCKER.md), configured with a real property and API key.
-The test machine must resolve the property's hostname to the proxy host.
+The Playwright suite uses headless Chromium to solve the hosted captcha and check
+completion, cookies, request forwarding, and denials against either proxy. Requires
+Node.js 22+ and the running demo above; Playwright accepts its local TLS certificates.
+
+Run in another terminal, using the same `EDGE_PROXY` as the running stack:
 
 ```sh
 make setup-e2e
-make test-e2e
+make test-e2e EDGE_PROXY=caddy
 ```
 
-The same `e2e/edge-sidecar.spec.js` runs against both demos. With nginx running:
+On Linux, add `PLAYWRIGHT_INSTALL_FLAGS=--with-deps` to `make setup-e2e`.
+Reports are in `playwright-report/`, traces in `test-results/`.
+CI tests both proxies; configure repository secrets `PC_SITEKEY`, `PC_API_KEY`,
+and variable `PC_EDGE_HOST` for the test property.
+
+Stop the demo when finished:
 
 ```sh
-make test-e2e EDGE_PROXY=nginx
+make stop-edge-docker EDGE_PROXY=caddy
 ```
-
-`EDGE_PROXY` selects Docker tooling; tests use the configured origin. Run one demo
-at a time, or set `E2E_BASE_URL` to the specific running demo you want to test.
-
-The runner reads `PC_EDGE_HOST` and `PC_EDGE_PORT` from `docker/.env` by default.
-`EDGE_DOCKER_ENV` selects another env file, and `E2E_BASE_URL` overrides the test
-origin. Both demos' local TLS certificates are accepted by the test browser and
-HTTP client.
-
-To use an already installed Google Chrome for local tests:
-
-```sh
-E2E_BROWSER_CHANNEL=chrome make test-e2e EDGE_PROXY=nginx
-```
-
-The default and CI continue to use Playwright's bundled Chromium. See
-[browser channels](https://playwright.dev/docs/browsers#google-chrome--microsoft-edge).
-
-The core suite checks a real hosted captcha solve, completion and cookie
-attributes, reload with the original query/fragment, authorized GET/POST traffic,
-and denial after clearing the cookie. It also checks POST body/method/URI
-preservation, application-generated `401` responses, and WebSocket upgrade-header
-forwarding. Separate HTTP tests cover unauthenticated WebSocket upgrades and other
-requests, invalid cookies, spoofed forwarded headers, POST
-navigation detection, AJAX/htmx denial, reserved helper routes, and completion
-validation failures.
-
-For Linux CI, install Chromium's system dependencies during setup:
-
-```sh
-make setup-e2e PLAYWRIGHT_INSTALL_FLAGS=--with-deps
-CI=1 E2E_BASE_URL=https://edge.privatecaptcha.test:8443 make test-e2e
-```
-
-Tests use one headless Chromium worker and isolated cookie contexts. Pass runner
-options through `EXTRA_E2E_FLAGS`, for example `make test-e2e EXTRA_E2E_FLAGS=--headed`.
-The HTML report is written to `playwright-report/`, with failure traces in
-`test-results/`.
-
-The E2E matrix in `.github/workflows/ci.yml` validates, builds, and starts each
-Docker demo independently. Compose stays attached and blocking while the test
-runner waits for readiness and runs the same suite alongside it, then stops the
-stack. Container logs stream directly into the job; failures also include
-proxy-specific Playwright artifacts.
-
-Configure these GitHub Actions repository settings:
-
-- Secrets `PC_SITEKEY` and `PC_API_KEY` for the test property.
-- Variable `PC_EDGE_HOST` matching the property's domain; defaults to
-  `edge.privatecaptcha.test`.
-
-CI maps that hostname to loopback and uses port `8443`. Credentials are supplied
-through the environment. The E2E job runs on pushes and same-repository pull
-requests, where repository secrets are available.

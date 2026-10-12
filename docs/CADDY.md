@@ -1,8 +1,9 @@
 # Caddy
 
 Use the built-in [forward_auth](https://caddyserver.com/docs/caddyfile/directives/forward_auth)
-directive with [`Caddyfile.example`](../docker/Caddyfile.example). The application
-needs no changes.
+directive to authorize requests before forwarding them to your application.
+Caddy serves the hosted captcha response at the original URL when access is denied;
+the application needs no changes.
 
 ## How it works
 
@@ -17,27 +18,77 @@ needs no changes.
 
 Caddy overwrites forwarded host, scheme, method, URI, and `X-PC-Client-IP`.
 The sidecar validates the actual connection peer and configured HTTPS origin.
-Keep it private and set `PC_TRUSTED_PROXY_HOSTS=caddy` in Docker, or configure
-the Caddy peer CIDRs. Other `/__privatecaptcha/*` paths return `404`.
+Keep it private and trust Caddy's actual peer IP/CIDR, or use
+`PC_TRUSTED_PROXY_HOSTS=caddy` for a container deployment. Other
+`/__privatecaptcha/*` paths return `404`.
 
-## Demo and tests
+## Configure the sidecar
 
-Configure the real property and hostname as described in [DOCKER.md](DOCKER.md).
-Start the blocking demo in one terminal:
+This example protects `https://example.com`, with the sidecar on `127.0.0.1:8080`
+and your application on `127.0.0.1:9000`. Configure the sidecar with:
 
-```sh
-make validate-edge-docker EDGE_PROXY=caddy
-make run-edge-docker EDGE_PROXY=caddy
+```dotenv
+PC_HOST=127.0.0.1
+PC_PORT=8080
+PC_SITEKEY=YOUR_SITEKEY
+PC_API_KEY=YOUR_API_KEY
+PC_PROTECTED_ORIGIN=https://example.com
+PC_TRUSTED_PROXY_CIDRS=127.0.0.1/32
 ```
 
-In another terminal:
+Use an enabled property for `example.com` with edge tokens enabled, and an API key
+with puzzle scope. See [configuration](../README.md#configuration) for all settings.
 
-```sh
-make test-e2e EDGE_PROXY=caddy
-make reload-edge-docker EDGE_PROXY=caddy
-make stop-edge-docker EDGE_PROXY=caddy
+## Caddyfile example
+
+Use this layout for your site's Caddyfile block, replacing the domain and upstream
+addresses.
+Caddy manages the site's HTTPS certificates automatically.
+
+```caddyfile
+example.com {
+    handle /__privatecaptcha/complete {
+        reverse_proxy 127.0.0.1:8080 {
+            header_up X-Forwarded-Host {http.request.hostport}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-PC-Client-IP {remote_host}
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 12s
+            }
+        }
+    }
+
+    handle /__privatecaptcha/* {
+        respond 404
+    }
+
+    handle {
+        forward_auth 127.0.0.1:8080 {
+            uri /auth
+            header_up X-Forwarded-Host {http.request.hostport}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Uri {uri}
+            header_up X-Forwarded-Method {method}
+            header_up X-PC-Client-IP {remote_host}
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 12s
+            }
+        }
+
+        reverse_proxy 127.0.0.1:9000
+    }
+}
 ```
 
-Compose file: [`docker-compose.caddy.yml`](../docker/docker-compose.caddy.yml).
-The demo uses Caddy's internal CA; use normal HTTPS certificates in production.
-The same [E2E suite](TESTING.md) runs against Caddy and nginx.
+Keep application handlers inside the final `handle` block, after `forward_auth`.
+
+```sh
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+For separate hosts or containers, replace the loopback addresses with private
+upstream addresses. An environment-based version is in
+[`Caddyfile.example`](../docker/Caddyfile.example).
