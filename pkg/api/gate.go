@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -46,10 +47,12 @@ func (c *gateCache) get(ctx context.Context) (*gatePage, error) {
 	if c.entry != nil && now.Before(c.entry.expiresAt) {
 		page := c.entry
 		c.mu.Unlock()
+		slog.Log(ctx, common.LevelTrace, "Using cached hosted gate", "expires_at", page.expiresAt)
 		return page, nil
 	}
 	if flight := c.flight; flight != nil {
 		c.mu.Unlock()
+		slog.Log(ctx, common.LevelTrace, "Waiting for in-flight hosted gate fetch")
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -58,7 +61,9 @@ func (c *gateCache) get(ctx context.Context) (*gatePage, error) {
 		}
 	}
 	if now.Before(c.retryAfter) {
+		retryAfter := c.retryAfter
 		c.mu.Unlock()
+		slog.DebugContext(ctx, "Hosted gate fetch is in retry cooldown", "retry_after", retryAfter)
 		return nil, errGateUnavailable
 	}
 	flight := &gateFlight{
@@ -87,8 +92,10 @@ func (c *gateCache) get(ctx context.Context) (*gatePage, error) {
 }
 
 func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, error) {
+	slog.DebugContext(ctx, "Fetching hosted gate", "revalidate", previous != nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
 	if err != nil {
+		slog.ErrorContext(ctx, "Failed to create hosted gate request", common.ErrAttr(err))
 		return nil, errGateUnavailable
 	}
 	req.Header.Set(HeaderAccept, "text/html")
@@ -103,6 +110,7 @@ func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, e
 	started := c.now()
 	response, err := fetch(ctx, c.client, req)
 	if err != nil {
+		slog.ErrorContext(ctx, "Hosted gate fetch failed", common.ErrAttr(err))
 		return nil, errGateUnavailable
 	}
 	defer response.Body.Close()
@@ -112,14 +120,17 @@ func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, e
 	case http.StatusOK:
 		mediaType, _, err := mime.ParseMediaType(upstream.Get(common.HeaderContentType))
 		if err != nil || mediaType != "text/html" {
+			slog.ErrorContext(ctx, "Hosted gate has an invalid content type", "upstream_status", response.StatusCode)
 			return nil, errGateUnavailable
 		}
 		body, err = io.ReadAll(response.Body)
 		if err != nil || len(body) == 0 {
+			slog.ErrorContext(ctx, "Hosted gate body is empty or unreadable", "bytes", len(body), common.ErrAttr(err))
 			return nil, errGateUnavailable
 		}
 	case http.StatusNotModified:
 		if previous == nil || (req.Header.Get(common.HeaderIfNoneMatch) == "" && req.Header.Get(HeaderIfModifiedSince) == "") {
+			slog.ErrorContext(ctx, "Hosted gate returned an unexpected not-modified response", "upstream_status", response.StatusCode)
 			return nil, errGateUnavailable
 		}
 		merged := previous.upstream.Clone()
@@ -130,10 +141,12 @@ func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, e
 		upstream = merged
 		body = previous.body
 	default:
+		slog.ErrorContext(ctx, "Hosted gate returned an unexpected status", "upstream_status", response.StatusCode)
 		return nil, errGateUnavailable
 	}
 	policies := upstream.Values(common.HeaderContentSecurityPolicy)
 	if len(policies) == 0 || policies[0] == "" {
+		slog.ErrorContext(ctx, "Hosted gate is missing its content security policy")
 		return nil, errGateUnavailable
 	}
 	headers := http.Header(common.SecurityHeaders).Clone()
@@ -144,6 +157,8 @@ func (c *gateCache) fetch(ctx context.Context, previous *gatePage) (*gatePage, e
 	headers.Set(common.HeaderXRobotsTag, "noindex, nofollow")
 	now := c.now()
 	expiresAt, cacheable := gateFreshness(upstream, now, now.Sub(started))
+	slog.DebugContext(ctx, "Fetched hosted gate", "upstream_status", response.StatusCode,
+		"duration_ms", now.Sub(started).Milliseconds(), "bytes", len(body), "cacheable", cacheable, "expires_at", expiresAt)
 	return &gatePage{
 		body:      body,
 		headers:   headers,

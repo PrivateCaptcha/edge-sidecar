@@ -23,6 +23,7 @@ var (
 )
 
 func run(ctx context.Context, s api.Settings, stage string) error {
+	slog.InfoContext(ctx, "Starting edge sidecar", "address", s.Address, "version", GitCommit, "stage", stage)
 	keys := api.NewKeyCache(s)
 	defer keys.CloseIdleConnections()
 	if err := keys.RunOnce(ctx, keys.NewParams()); err != nil {
@@ -68,6 +69,7 @@ func run(ctx context.Context, s api.Settings, stage string) error {
 			err = nil
 		}
 	}
+	slog.InfoContext(ctx, "Shutting down edge sidecar", common.ErrAttr(err))
 	stopJobs()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -76,6 +78,7 @@ func run(ctx context.Context, s api.Settings, stage string) error {
 		err = errors.Join(err, shutdownErr)
 	}
 	<-jobsDone
+	slog.InfoContext(ctx, "Edge sidecar stopped", common.ErrAttr(err))
 	return err
 }
 

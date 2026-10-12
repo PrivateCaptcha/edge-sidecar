@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/config"
 	realclientip "github.com/realclientip/realclientip-go"
 )
@@ -52,6 +54,7 @@ func (s Settings) requestHost(r *http.Request) (string, error) {
 	peer := (realclientip.RemoteAddrStrategy{}).ClientIP(r.Header, r.RemoteAddr)
 	ip, err := netip.ParseAddr(peer)
 	if err != nil {
+		slog.WarnContext(r.Context(), "Proxy peer address is invalid", "endpoint", r.URL.Path)
 		return "", errInvalidHost
 	}
 	trusted := false
@@ -64,6 +67,8 @@ func (s Settings) requestHost(r *http.Request) (string, error) {
 		for _, host := range s.trustedProxyHosts {
 			addresses, err := s.lookupProxy(ctx, "ip", host)
 			if err != nil {
+				slog.WarnContext(ctx, "Trusted proxy hostname lookup failed", "endpoint", r.URL.Path,
+					"proxy_host", host, common.ErrAttr(err))
 				continue
 			}
 			for _, address := range addresses {
@@ -75,19 +80,33 @@ func (s Settings) requestHost(r *http.Request) (string, error) {
 		}
 	}
 	if !trusted {
+		slog.WarnContext(r.Context(), "Request peer is not a trusted proxy", "endpoint", r.URL.Path, "proxy_peer", peer)
 		return "", errInvalidHost
 	}
 	host, err := singleHeader(r, HeaderForwardedHost)
 	if err != nil {
+		slog.WarnContext(r.Context(), "Forwarded header is missing or malformed", "endpoint", r.URL.Path,
+			"header", HeaderForwardedHost, "header_count", len(r.Header.Values(HeaderForwardedHost)))
 		return "", err
 	}
 	proto, err := singleHeader(r, HeaderForwardedProto)
 	if err != nil {
+		slog.WarnContext(r.Context(), "Forwarded header is missing or malformed", "endpoint", r.URL.Path,
+			"header", HeaderForwardedProto, "header_count", len(r.Header.Values(HeaderForwardedProto)))
 		return "", err
 	}
 	origin, hostname, err := normalizeOrigin(proto + "://" + host)
-	if err != nil || origin != s.protectedOrigin {
+	if err != nil {
+		slog.WarnContext(r.Context(), "Forwarded origin is invalid", "endpoint", r.URL.Path,
+			"expected_origin", s.protectedOrigin, "https", proto == "https")
 		return "", errInvalidHost
 	}
+	if origin != s.protectedOrigin {
+		slog.WarnContext(r.Context(), "Forwarded origin does not match protected origin", "endpoint", r.URL.Path,
+			"origin", origin, "expected_origin", s.protectedOrigin)
+		return "", errInvalidHost
+	}
+	slog.Log(r.Context(), common.LevelTrace, "Validated proxy request", "endpoint", r.URL.Path,
+		"proxy_peer", peer, "origin", origin)
 	return hostname, nil
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -43,7 +44,9 @@ func (a *Authorizer) complete(w http.ResponseWriter, r *http.Request) {
 		origin, _, err = normalizeOrigin(origin)
 	}
 	if err != nil || origin != a.s.protectedOrigin {
-		deny(w, r, http.StatusForbidden, reasonBadOrigin)
+		deny(w, r, http.StatusForbidden, reasonBadOrigin,
+			slog.Int("origin_header_count", len(r.Header.Values(common.HeaderOrigin))),
+			slog.String("origin", origin), slog.String("expected_origin", a.s.protectedOrigin))
 		return
 	}
 	if values := r.Header.Values(HeaderSecFetchSite); len(values) != 0 && (len(values) != 1 || values[0] != "same-origin") {
@@ -64,10 +67,12 @@ func (a *Authorizer) complete(w http.ResponseWriter, r *http.Request) {
 		deny(w, r, http.StatusUnsupportedMediaType, reasonContentType)
 		return
 	}
+	slog.Log(r.Context(), common.LevelTrace, "Captcha completion request validated", "endpoint", completePath)
 	a.limitedComplete.ServeHTTP(w, r)
 }
 
 func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
+	slog.Log(r.Context(), common.LevelTrace, "Captcha completion passed rate limit", "endpoint", completePath)
 	if r.ContentLength > maxFormBytes {
 		deny(w, r, http.StatusRequestEntityTooLarge, reasonBodySize)
 		return
@@ -100,13 +105,19 @@ func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
 		deny(w, r, http.StatusBadRequest, reasonMalformedForm)
 		return
 	}
+	slog.Log(r.Context(), common.LevelTrace, "Verifying captcha solution", "endpoint", completePath, "attempts", 1)
+	started := time.Now()
 	result, err := a.verifier.Verify(r.Context(), pc.VerifyInput{
 		Solution: proof,
 		Sitekey:  a.s.sitekey,
 		Attempts: 1,
 	})
 	if err != nil {
-		var details []slog.Attr
+		details := []slog.Attr{
+			slog.Int64("duration_ms", time.Since(started).Milliseconds()),
+			slog.Bool("timeout", errors.Is(err, context.DeadlineExceeded)),
+			slog.Bool("canceled", errors.Is(err, context.Canceled)),
+		}
 		if status, ok := pc.GetStatusCode(err); ok {
 			details = append(details, slog.Int("upstream_status", status))
 			if status == http.StatusBadRequest {
@@ -117,6 +128,9 @@ func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
 		deny(w, r, http.StatusBadGateway, reasonVerifyUnavailable, details...)
 		return
 	}
+	slog.Log(r.Context(), common.LevelTrace, "Captcha verification API responded", "endpoint", completePath,
+		"duration_ms", time.Since(started).Milliseconds(), "success", result.Success,
+		"verification_code", int(result.Code), "has_edge_token", result.EdgeToken != "")
 	if !result.Success {
 		deny(w, r, http.StatusUnauthorized, reasonUnsuccessful, slog.Int("verification_code", int(result.Code)))
 		return
@@ -128,7 +142,7 @@ func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
 	_, host, _ := normalizeOrigin(a.s.protectedOrigin)
 	claims, reason := a.verify(r.Context(), result.EdgeToken, host)
 	if reason != "" {
-		deny(w, r, http.StatusUnauthorized, reason)
+		deny(w, r, http.StatusUnauthorized, reason, slog.String("stage", "edge_token"))
 		return
 	}
 	maxAge := int(time.Until(claims.ExpiresAt.Time) / time.Second)
@@ -151,6 +165,7 @@ func (a *Authorizer) completeSolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, cookie)
-	slog.InfoContext(r.Context(), "Edge captcha completion succeeded", "endpoint", completePath)
+	slog.Log(r.Context(), common.LevelTrace, "Edge captcha completion succeeded", "endpoint", completePath,
+		"status", http.StatusNoContent, "cookie_name", edgeCookieName, "cookie_max_age", maxAge, "expires_at", cookie.Expires)
 	w.WriteHeader(http.StatusNoContent)
 }

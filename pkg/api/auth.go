@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
+	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/monitoring"
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/ratelimit"
 	pc "github.com/PrivateCaptcha/private-captcha-go"
 	"github.com/golang-jwt/jwt/v5"
@@ -71,11 +72,13 @@ func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
 		client: keys.client,
 		now:    time.Now,
 	}
+	slog.Debug("Configured edge authorizer", "protected_origin", s.protectedOrigin,
+		"trusted_proxy_cidrs", s.trustedProxies, "trusted_proxy_hosts", s.trustedProxyHosts)
 	return a, nil
 }
 
 func (a *Authorizer) Setup(router *http.ServeMux) {
-	chain := alice.New(common.ServiceMiddleware(ServiceName), common.Recovered(nil), common.SoftTimeoutHandler(requestTimeout))
+	chain := alice.New(common.ServiceMiddleware(ServiceName), monitoring.Logged, common.Recovered(nil), common.SoftTimeoutHandler(requestTimeout))
 	router.Handle(http.MethodGet+" "+healthPath, common.HttpStatus(http.StatusNoContent))
 	router.Handle(http.MethodGet+" "+authPath, chain.ThenFunc(a.auth))
 	router.Handle(http.MethodPost+" "+completePath, http.MaxBytesHandler(chain.ThenFunc(a.complete), maxFormBytes))
@@ -89,26 +92,37 @@ func (a *Authorizer) auth(w http.ResponseWriter, r *http.Request) {
 		if reason == reasonMissing || reason == reasonExpired {
 			level = slog.LevelDebug
 		}
-		slog.Log(ctx, level, "Edge authorization denied", "reason", reason, "status", http.StatusUnauthorized, "endpoint", authPath)
-		if reason != reasonBadForwarded && reason != reasonMalformedRequest && browserNavigation(r) {
+		navigation := browserNavigation(r)
+		slog.Log(ctx, level, "Edge authorization denied", "reason", reason, "status", http.StatusUnauthorized,
+			"endpoint", authPath, "browser_navigation", navigation)
+		if reason != reasonBadForwarded && reason != reasonMalformedRequest && navigation {
+			slog.DebugContext(ctx, "Preparing hosted captcha challenge", "endpoint", authPath)
 			if page, err := a.gates.get(ctx); err == nil {
 				common.WriteHeaders(w, page.headers)
 				w.WriteHeader(http.StatusUnauthorized)
-				if _, err := w.Write(page.body); err != nil {
-					slog.DebugContext(ctx, "Failed to send gate response")
+				if sent, err := w.Write(page.body); err != nil {
+					slog.DebugContext(ctx, "Failed to send gate response", "endpoint", authPath, "bytes", sent, common.ErrAttr(err))
+				} else {
+					slog.DebugContext(ctx, "Sent hosted captcha challenge", "endpoint", authPath, "status", http.StatusUnauthorized, "bytes", sent)
 				}
 				return
+			} else {
+				slog.ErrorContext(ctx, "Hosted gate is unavailable", "endpoint", authPath, common.ErrAttr(err))
 			}
-			slog.ErrorContext(ctx, "Hosted gate is unavailable", "endpoint", authPath)
 		}
+		slog.DebugContext(ctx, "Returning authorization denial without a challenge", "endpoint", authPath,
+			"reason", reason, "browser_navigation", navigation)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
+	slog.Log(ctx, common.LevelTrace, "Edge authorization succeeded", "endpoint", authPath, "status", http.StatusNoContent)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *Authorizer) validate(r *http.Request) denialReason {
 	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(r.RequestURI) > maxRequestURI {
+		slog.WarnContext(r.Context(), "Malformed authorization request", "endpoint", authPath,
+			"content_length", r.ContentLength, "transfer_encodings", len(r.TransferEncoding), "uri_length", len(r.RequestURI))
 		return reasonMalformedRequest
 	}
 	host, err := a.s.requestHost(r)
@@ -125,17 +139,22 @@ func (a *Authorizer) validate(r *http.Request) denialReason {
 		}
 	}
 	if cookieCount == 0 {
+		slog.DebugContext(r.Context(), "Edge authorization cookie is missing", "endpoint", authPath, "cookie_name", edgeCookieName)
 		return reasonMissing
 	}
 	cookies := r.CookiesNamed(edgeCookieName)
 	if cookieCount != 1 || len(cookies) != 1 || len(cookies[0].Value) == 0 || len(cookies[0].Value) > maxTokenBytes {
+		slog.DebugContext(r.Context(), "Edge authorization cookie is malformed", "endpoint", authPath,
+			"cookie_count", cookieCount, "parsed_cookie_count", len(cookies))
 		return reasonMalformed
 	}
+	slog.Log(r.Context(), common.LevelTrace, "Checking edge authorization cookie", "endpoint", authPath)
 	_, reason := a.verify(r.Context(), cookies[0].Value, host)
 	return reason
 }
 
 func (a *Authorizer) verify(ctx context.Context, raw, host string) (*edgeClaims, denialReason) {
+	slog.Log(ctx, common.LevelTrace, "Validating edge token", "host", host)
 	if len(raw) == 0 || len(raw) > maxTokenBytes {
 		return nil, reasonMalformed
 	}
@@ -184,6 +203,7 @@ func (a *Authorizer) verify(ctx context.Context, raw, host string) (*edgeClaims,
 	if err != nil || signedHost != host {
 		return nil, reasonBadHost
 	}
+	slog.Log(ctx, common.LevelTrace, "Edge token validated", "host", host, "expires_at", claims.ExpiresAt.UTC())
 	return claims, ""
 }
 

@@ -86,14 +86,18 @@ func (c *KeyCache) cached(kid string) *ecdsa.PublicKey {
 
 func (c *KeyCache) lookup(ctx context.Context, kid string) (*ecdsa.PublicKey, error) {
 	if key := c.cached(kid); key != nil {
+		slog.Log(ctx, common.LevelTrace, "Using cached edge token key")
 		return key, nil
 	}
+	slog.DebugContext(ctx, "Edge token key is not cached; refreshing JWKS")
 	if err := c.refresh(ctx, true); err != nil {
 		return nil, errUnknownKey
 	}
 	if key := c.cached(kid); key != nil {
+		slog.Log(ctx, common.LevelTrace, "Edge token key found after JWKS refresh")
 		return key, nil
 	}
+	slog.WarnContext(ctx, "Edge token key remains unknown after JWKS refresh")
 	return nil, errUnknownKey
 }
 
@@ -106,19 +110,24 @@ func (c *KeyCache) refresh(ctx context.Context, unknown bool) error {
 	defer func() { <-c.refreshGate }()
 	if unknown {
 		if time.Since(c.lastUnknownRefresh) < unknownKeyRefreshGap {
+			slog.DebugContext(ctx, "Skipping unknown-key JWKS refresh during cooldown")
 			return nil
 		}
 		c.lastUnknownRefresh = time.Now()
 	}
+	slog.DebugContext(ctx, "Refreshing JWKS", "jwks_url", c.url, "unknown_key", unknown)
+	started := time.Now()
 	keys, err := c.fetch(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "JWKS refresh failed; keeping cached keys", common.ErrAttr(err))
+		slog.WarnContext(ctx, "JWKS refresh failed; keeping cached keys", "unknown_key", unknown,
+			"duration_ms", time.Since(started).Milliseconds(), common.ErrAttr(err))
 		return err
 	}
 	c.mu.Lock()
 	c.keys = keys
 	c.mu.Unlock()
-	slog.InfoContext(ctx, "Refreshed JWKS", "keys", len(keys))
+	slog.InfoContext(ctx, "Refreshed JWKS", "keys", len(keys), "unknown_key", unknown,
+		"duration_ms", time.Since(started).Milliseconds())
 	return nil
 }
 

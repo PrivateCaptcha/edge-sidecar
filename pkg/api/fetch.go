@@ -33,13 +33,23 @@ func fetch(ctx context.Context, client *http.Client, req *http.Request) (*http.R
 			case <-time.After(b.Duration()):
 			}
 		}
+		started := time.Now()
+		slog.Log(ctx, common.LevelTrace, "Fetching upstream resource", "upstream_host", req.URL.Host,
+			"upstream_path", req.URL.Path, "attempt", attempt+1)
 		response, err = doFetch(client, req.Clone(ctx))
+		if err == nil {
+			slog.Log(ctx, common.LevelTrace, "Fetched upstream resource", "upstream_host", req.URL.Host,
+				"upstream_path", req.URL.Path, "upstream_status", response.StatusCode,
+				"attempt", attempt+1, "duration_ms", time.Since(started).Milliseconds())
+			break
+		}
+		slog.WarnContext(ctx, "Upstream fetch failed", "upstream_host", req.URL.Host, "upstream_path", req.URL.Path,
+			"attempt", attempt+1, "duration_ms", time.Since(started).Milliseconds(), common.ErrAttr(err))
 		var retryable common.RetriableError
-		if err == nil || !errors.As(err, &retryable) {
+		if !errors.As(err, &retryable) {
 			break
 		}
 		err = retryable.Unwrap()
-		slog.WarnContext(ctx, "Upstream fetch failed", "attempt", attempt+1, common.ErrAttr(err))
 	}
 	return response, err
 }
@@ -65,13 +75,20 @@ type verificationTransport struct {
 }
 
 func (t verificationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	started := time.Now()
+	slog.Log(req.Context(), common.LevelTrace, "Sending captcha verification request",
+		"upstream_host", req.URL.Host, "upstream_path", req.URL.Path)
 	response, err := t.RoundTripper.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
 	if err := bufferResponse(response, maxVerifyBytes); err != nil {
+		slog.WarnContext(req.Context(), "Failed to read captcha verification response", "upstream_status", response.StatusCode,
+			"duration_ms", time.Since(started).Milliseconds())
 		return nil, err
 	}
+	slog.Log(req.Context(), common.LevelTrace, "Received captcha verification response", "upstream_status", response.StatusCode,
+		"duration_ms", time.Since(started).Milliseconds())
 	return response, nil
 }
 
