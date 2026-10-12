@@ -1,0 +1,38 @@
+[Unit]
+Description=Edge sidecar
+After=network.target
+# optional: add caddy.service (if you use caddy) to After above
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/edge-sidecar -env ${CREDENTIALS_DIRECTORY}/pc.env
+ExecStop=/bin/kill $MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
+NonBlocking=true
+KillMode=control-group
+Restart=on-failure
+RestartSec=5s
+# Hardening
+CacheDirectory=edgesidecar
+RuntimeDirectory=edgesidecar
+LoadCredential=pc.env:/etc/edgesidecar/env.conf
+DynamicUser=true
+PrivateUsers=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectSystem=full
+ProtectClock=true
+ProtectProc=noaccess
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+LockPersonality=true
+RemoveIPC=true
+SystemCallArchitectures=native
+[Install]
+WantedBy=multi-user.target
