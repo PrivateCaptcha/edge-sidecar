@@ -4,12 +4,14 @@
 
 [![CI](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml) [![Go Lint](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml)
 
-Caddy `forward_auth` and nginx `auth_request` authorization with a hosted captcha
-fallback. The application needs no changes; the web server proxies application
-traffic, while the sidecar handles only `/auth`, `/__privatecaptcha/complete`, and
-`/healthz`.
+This is a sidecar process that can be used by [Caddy](docs/CADDY.md) (via `forward_auth`) and [nginx](docs/NGINX.md) (via `auth_request`) to protect an upstream with a CAPTCHA. The application served by the HTTP server does not need any changes, the web server proxies application traffic, while the sidecar handles only `/auth`, `/__privatecaptcha/complete`, and `/healthz`.
 
-Integration notes: [Caddy](docs/CADDY.md) and [nginx](docs/NGINX.md).
+## Usage
+
+Web server | Link
+--- | ---
+Caddy | [guide](docs/CADDY.md)
+nginx | [guide](docs/NGINX.md)
 
 ## Flow
 
@@ -33,37 +35,32 @@ Browser -> proxy -> GET /auth
                   Set-Cookie + 204 -> browser reload
 ```
 
-Known-key JWT checks are local. Keys are fetched at startup, refreshed periodically,
-and refreshed once on an unknown `kid`. Failed refreshes retain cached keys.
-Gate HTML is cached according to upstream freshness, but browser challenges
-always use `Cache-Control: no-store`. Non-navigation requests get an empty `401`.
+Known-key JWT checks are local. Keys are fetched at startup, refreshed periodically, and refreshed once on an unknown `kid`. Failed refreshes retain cached keys. Gate HTML is cached according to upstream freshness, but browser challenges always use `Cache-Control: no-store`. Non-navigation requests get an empty `401`.
 
-The hosted gate owns submission/reload JavaScript and CSP. The sidecar passes
-HTML/CSP through unchanged.
+The hosted gate owns submission/reload JavaScript and CSP. The sidecar passes HTML/CSP through unchanged.
 
-nginx uses a status-only auth subrequest, then a second internal `/auth` request
-on denial to return the full response at the original browser URL.
+nginx uses a status-only auth subrequest, then a second internal `/auth` request on denial to return the full response at the original browser URL.
 
 ## Run
 
+Build sidecar:
+```
+make build
+```
+
+Start:
+
 ```sh
-make build-edge-sidecar
-PC_SITEKEY=YOUR_SITEKEY PC_API_KEY=YOUR_API_KEY \
-    PC_PROTECTED_ORIGIN=https://example.com \
-    PC_TRUSTED_PROXY_CIDRS=127.0.0.1/32 ./bin/edge-sidecar
+PC_SITEKEY=YOUR_SITEKEY \
+PC_API_KEY=YOUR_API_KEY \
+PC_PROTECTED_ORIGIN=https://example.com \
+PC_TRUSTED_PROXY_CIDRS=127.0.0.1/32 \
+  ./bin/edge-sidecar
 ```
 
 See [TESTING.md](docs/TESTING.md) for Docker setup.
 
 ## Configuration
-
-Uses the shared [environment configuration](../../pkg/config/env.go). `-env FILE`
-or `-env stdin` loads dotenv values. Send SIGHUP (`kill -HUP PID`) to reread a
-dotenv file and apply validated settings to new requests. Failed reloads keep the
-active configuration, and in-flight requests finish with their previous settings.
-Changing `PC_HOST` or `PC_PORT` requires a restart. Values loaded from stdin remain
-fixed at startup. systemd `LoadCredential` files are activation-time snapshots;
-restart the service to refresh those credentials.
 
 | Setting | Default / requirement |
 | --- | --- |
@@ -81,6 +78,8 @@ restart the service to refresh those credentials.
 
 The property must have edge-tokens enabled. API verification uses HTTPS; loopback HTTP is supported for local JWKS fixtures. Fixed GET fetches retry transient failures with bounded backoff.
 
+Send SIGHUP (`kill -HUP PID`) to reread a dotenv file (if you used `-env` argument with path to file) and apply validated settings to new requests (changing `PC_HOST` or `PC_PORT` requires a restart).
+
 ## Trust and token scope
 
 ```text
@@ -93,19 +92,8 @@ untrusted browser headers
     JWT: signature + issuer + aud=sitekey + signed hostname
 ```
 
-Proxy headers describe the request; they do not authenticate the caller.
-Keep the sidecar private and trust only configured proxy peers. `X-Forwarded-For`
-identifies a browser IP, not the socket peer; the completion limiter uses the
-proxy's overwritten `X-PC-Client-IP` instead.
-Trusted proxy DNS results are cached for 10 seconds; expired results are never
-used after a failed lookup. Reloading clears this cache.
+Proxy headers describe the request; they do not authenticate the caller. Keep the sidecar private and trust only configured proxy peers. `X-Forwarded-For` identifies a browser IP, not the socket peer; the completion limiter uses the proxy's overwritten `X-PC-Client-IP` instead. Trusted proxy DNS results are cached for 10 seconds; expired results are never used after a failed lookup. Reloading clears this cache.
 
-Current tokens use ES256, `typ=pc-edge+jwt`, `v=1`, `aud=<sitekey>`, and a signed
-`host` claim. Scheme/port are enforced separately through the configured origin.
-Cookie: `__Host-privatecaptcha-edge`, Secure, HttpOnly, SameSite=Lax, Path=/,
-no Domain, and lifetime no longer than JWT expiry.
+Current tokens use ES256, `typ=pc-edge+jwt`, `v=1`, `aud=<sitekey>`, and a signed `host` claim. Scheme/port are enforced separately through the configured origin. Cookie: `__Host-privatecaptcha-edge`, Secure, HttpOnly, SameSite=Lax, Path=/, no Domain, and lifetime no longer than JWT expiry.
 
-Completion requires a same-origin POST, bounded form/proof sizes, and rate limits.
-Verification is never automatically retried because proofs can be single-use.
-Failures issue no cookie and expose only generic errors. Logs never contain
-API keys, proofs, JWTs, or cookie values.
+Completion requires a same-origin POST, bounded form/proof sizes, and rate limits. Verification is never automatically retried because proofs can be single-use. Failures issue no cookie and expose only generic errors. Logs never contain API keys, proofs, JWTs, or cookie values.
