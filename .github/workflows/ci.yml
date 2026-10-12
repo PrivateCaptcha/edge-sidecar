@@ -76,8 +76,8 @@ jobs:
 
     - name: Run the demo and E2E tests
       run: |
-        make validate-edge-docker
-        make start-edge-docker
+        make validate-docker
+        make start-docker
         ready=false
         for attempt in {1..60}; do
           if status=$(curl --silent --insecure --connect-timeout 1 --max-time 2 \
@@ -96,7 +96,7 @@ jobs:
 
     - name: Show demo logs on failure
       if: failure()
-      run: make logs-edge-docker EDGE_DOCKER_LOG_FLAGS=--no-color
+      run: make logs-docker EDGE_DOCKER_LOG_FLAGS=--no-color
 
     - name: Upload Playwright failure artifacts
       if: failure()
@@ -111,4 +111,4 @@ jobs:
 
     - name: Stop the demo stack
       if: always()
-      run: make stop-edge-docker
+      run: make stop-docker

@@ -1,4 +1,4 @@
-.PHONY: build-edge-sidecar setup-edge-docker validate-edge-docker start-edge-docker run-edge-docker stop-edge-docker reload-edge-docker logs-edge-docker
+.PHONY: build-sidecar setup-docker validate-docker start-docker run-docker stop-docker reload-docker logs-docker
 .PHONY: setup-e2e test-e2e
 
 STAGE ?= dev
@@ -25,7 +25,7 @@ vendors:
 	go mod tidy
 	go mod vendor
 
-build: build-edge-sidecar
+build: build-sidecar
 
 lint:
 	$(GOPATH)/bin/golangci-lint run
@@ -43,36 +43,36 @@ setup-e2e:
 test-e2e:
 	env EDGE_PROXY="$(EDGE_PROXY)" EDGE_DOCKER_ENV="$(EDGE_DOCKER_ENV)" npm run test:e2e -- $(EXTRA_E2E_FLAGS)
 
-build-edge-sidecar:
+build-sidecar:
 	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o "$(BUILD_OUTPUT)" ./cmd/edge-sidecar
 
-build-edge-sidecar-prod:
+build-sidecar-prod:
 	env GOFLAGS="-mod=vendor" CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -ldflags="-s -w -X main.GitCommit=$(GIT_COMMIT)" $(EXTRA_BUILD_FLAGS) -o bin/edge-sidecar-prod ./cmd/edge-sidecar
 
 docker/.env: docker/.env.example
 	test -e "$@" || cp -v docker/.env.example "$@"
 
-setup-edge-docker: $(EDGE_DOCKER_ENV)
+setup-docker: $(EDGE_DOCKER_ENV)
 
-validate-edge-docker:
+validate-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) config --quiet
 
-start-edge-docker:
+start-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build --detach $(EDGE_DOCKER_FLAGS)
 
-run-edge-docker:
-	$(if $(filter -d --detach% --wait --wait=%,$(EDGE_DOCKER_FLAGS)),$(error run-edge-docker requires attached foreground mode; detach and wait flags are not supported))
+run-docker:
+	$(if $(filter -d --detach% --wait --wait=%,$(EDGE_DOCKER_FLAGS)),$(error run-docker requires attached foreground mode; detach and wait flags are not supported))
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) up --build $(EDGE_DOCKER_FLAGS)
 
-stop-edge-docker:
+stop-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) down
 
-reload-edge-docker:
+reload-docker:
 ifeq ($(EDGE_PROXY),caddy)
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 else
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) exec nginx sh -ec '/docker-entrypoint.d/20-envsubst-on-templates.sh && nginx -t && nginx -s reload'
 endif
 
-logs-edge-docker:
+logs-docker:
 	@env GIT_COMMIT="$(GIT_COMMIT)" $(DOCKER) compose --env-file "$(EDGE_DOCKER_ENV)" $(EDGE_DOCKER_COMPOSE_FILES) logs $(EDGE_DOCKER_LOG_FLAGS) privatecaptcha-authorizer $(EDGE_PROXY) app

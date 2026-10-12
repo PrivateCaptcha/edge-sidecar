@@ -14,7 +14,7 @@ Requires Docker. Both demos run a proxy, the sidecar, and a small
 application against the real PrivateCaptcha API.
 
 ```sh
-make setup-edge-docker
+make setup-docker
 ```
 
 Edit the ignored `docker/.env`:
@@ -32,15 +32,15 @@ run one stack at a time because both use the same port.
 Start the stack in one terminal and leave it running:
 
 ```sh
-make validate-edge-docker EDGE_PROXY=caddy
-make run-edge-docker EDGE_PROXY=caddy
+make validate-docker EDGE_PROXY=caddy
+make run-docker EDGE_PROXY=caddy
 ```
 
 For manual testing, open `https://<PC_EDGE_HOST>:<PC_EDGE_PORT>/private`.
 Caddy uses an internal CA; nginx uses a self-signed certificate. A manual browser
 needs the demo CA/certificate trusted or an exception.
 
-After editing proxy configuration, run `make reload-edge-docker EDGE_PROXY=caddy`.
+After editing proxy configuration, run `make reload-docker EDGE_PROXY=caddy`.
 
 ## End-to-end tests
 
@@ -63,5 +63,5 @@ and variable `PC_EDGE_HOST` for the test property.
 Stop the demo when finished:
 
 ```sh
-make stop-edge-docker EDGE_PROXY=caddy
+make stop-docker EDGE_PROXY=caddy
 ```
