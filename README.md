@@ -4,7 +4,11 @@
 
 [![CI](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/ci.yml) [![Go Lint](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/PrivateCaptcha/edge-sidecar/actions/workflows/golangci-lint.yml)
 
-This is a sidecar process that can be used by [Caddy](docs/CADDY.md) (via `forward_auth`) and [nginx](docs/NGINX.md) (via `auth_request`) to protect an upstream with a CAPTCHA. The application served by the HTTP server does not need any changes, the web server proxies application traffic, while the sidecar handles only `/auth`, `/__privatecaptcha/complete`, and `/healthz`.
+This is a sidecar process that can be used by [Caddy](docs/CADDY.md) (via `forward_auth`) and [nginx](docs/NGINX.md) (via `auth_request`) to protect an upstream with a CAPTCHA.
+
+The application served by the HTTP server does not need any changes, the web server proxies application traffic, while the sidecar handles only `/auth`, `/__privatecaptcha/complete`, and `/healthz`.
+
+CAPTCHA [settings](https://docs.privatecaptcha.com/docs/reference/property-settings/) (such as difficulty, compute-hard or memory-hard etc.) and [protection rules](https://docs.privatecaptcha.com/docs/reference/rules/) (e.g. based on IP, HTTP headers, Country, User-Agent and others) are configured in the [Portal](https://portal.privatecaptcha.com/), this sidecar receives only the Sitekey (aka widget ID) and an API key for verification.
 
 ## Usage
 
