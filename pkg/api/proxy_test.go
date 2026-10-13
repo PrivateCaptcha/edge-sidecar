@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,26 +80,121 @@ func TestEdgeSidecarProxyServiceName(t *testing.T) {
 
 func TestEdgeSidecarProxyCanceledLookup(t *testing.T) {
 	f := newEdgeFixture(t)
-	f.a.s.trustedProxies = nil
-	f.a.s.trustedProxyHosts = []string{"caddy"}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	defer close(release)
 	var calls atomic.Int32
+	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.10")}
 	f.a.s.lookupProxy = func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
-		if calls.Add(1) == 1 {
+		calls.Add(1)
+		entered <- struct{}{}
+		select {
+		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-release:
 		}
-		return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+		return addresses, nil
 	}
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.a.s.proxyDNS.lookup(ctx, "caddy", f.a.s.lookupProxy)
+		done <- err
+	}()
+	<-entered
 	cancel()
-	r := authRequest(f.token(t, nil, nil)).WithContext(ctx)
-	r.RemoteAddr = "192.0.2.10:8080"
-	f.a.auth(httptest.NewRecorder(), r)
-	r = authRequest(f.token(t, nil, nil))
-	r.RemoteAddr = "192.0.2.10:8080"
-	w := httptest.NewRecorder()
-	f.a.auth(w, r)
-	if w.Code != http.StatusNoContent || calls.Load() != 2 {
-		t.Fatal("canceled lookup poisoned the proxy DNS cache")
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller waited for the shared lookup")
+	}
+	healthyDone := make(chan error, 1)
+	go func() {
+		addrs, err := f.a.s.proxyDNS.lookup(t.Context(), "caddy", f.a.s.lookupProxy)
+		if err != nil || len(addrs) != 1 || addrs[0] != addresses[0] {
+			err = errors.New("shared lookup returned an incorrect result")
+		}
+		healthyDone <- err
+	}()
+	release <- struct{}{}
+	if err := <-healthyDone; err != nil {
+		t.Fatalf("healthy caller lost its result: %v", err)
+	}
+	if _, err := f.a.s.proxyDNS.lookup(t.Context(), "caddy", f.a.s.lookupProxy); err != nil || calls.Load() != 1 {
+		t.Fatalf("canceled caller poisoned the cache: calls=%d error=%v", calls.Load(), err)
+	}
+}
+
+func TestEdgeSidecarProxyDNSParallel(t *testing.T) {
+	f := newEdgeFixture(t)
+	const n = 10
+	const latency = 80 * time.Millisecond
+	var calls atomic.Int32
+	f.a.s.lookupProxy = func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+		calls.Add(1)
+		select {
+		case <-time.After(latency):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+	}
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			host := "host" + strconv.Itoa(i)
+			if _, err := f.a.s.proxyDNS.lookup(t.Context(), host, f.a.s.lookupProxy); err != nil {
+				t.Errorf("lookup %s failed: %v", host, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	if calls.Load() != n {
+		t.Fatalf("expected %d lookups, got %d", n, calls.Load())
+	}
+	if elapsed >= time.Duration(n)*latency/2 {
+		t.Fatalf("lookups serialized: %d lookups took %v (expected ~%v)", n, elapsed, latency)
+	}
+}
+
+func TestEdgeSidecarProxyDNSSingleFlight(t *testing.T) {
+	f := newEdgeFixture(t)
+	const n = 20
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{}, 1)
+	defer close(release)
+	var calls atomic.Int32
+	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.1")}
+	f.a.s.lookupProxy = func(context.Context, string, string) ([]netip.Addr, error) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return addresses, nil
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			addrs, err := f.a.s.proxyDNS.lookup(t.Context(), "caddy", f.a.s.lookupProxy)
+			if err != nil || len(addrs) != 1 || addrs[0] != addresses[0] {
+				t.Errorf("coalesced lookup returned %v (err %v)", addrs, err)
+			}
+		}()
+	}
+	<-entered
+	release <- struct{}{}
+	wg.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("expected a single coalesced lookup, got %d", calls.Load())
 	}
 }
 
