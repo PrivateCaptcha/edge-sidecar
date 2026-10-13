@@ -23,32 +23,63 @@ type proxyDNSResult struct {
 	expiresAt time.Time
 }
 
+type proxyDNSFlight struct {
+	done      chan struct{}
+	addresses []netip.Addr
+	err       error
+}
+
 type proxyDNSCache struct {
 	mu      sync.Mutex
 	entries map[string]proxyDNSResult
+	flights map[string]*proxyDNSFlight
 	now     func() time.Time
 }
 
 func (c *proxyDNSCache) lookup(ctx context.Context, host string, lookup func(context.Context, string, string) ([]netip.Addr, error)) ([]netip.Addr, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if result, found := c.entries[host]; found && c.now().Before(result.expiresAt) {
+		c.mu.Unlock()
 		return result.addresses, result.err
 	}
+	flight := c.flights[host]
+	if flight == nil {
+		flight = &proxyDNSFlight{done: make(chan struct{})}
+		if c.flights == nil {
+			c.flights = make(map[string]*proxyDNSFlight)
+		}
+		c.flights[host] = flight
+		go c.fetch(context.WithoutCancel(ctx), host, lookup, flight)
+	}
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-flight.done:
+		return flight.addresses, flight.err
+	}
+}
+
+func (c *proxyDNSCache) fetch(ctx context.Context, host string, lookup func(context.Context, string, string) ([]netip.Addr, error), flight *proxyDNSFlight) {
+	ctx, cancel := context.WithTimeout(ctx, proxyTimeout)
+	defer cancel()
 	addresses, err := lookup(ctx, "ip", host)
-	if ctx.Err() == context.Canceled {
-		return addresses, err
+	c.mu.Lock()
+	if ctx.Err() != context.Canceled {
+		ttl := proxyDNSTTL
+		if err != nil || len(addresses) == 0 {
+			ttl = proxyTimeout
+		}
+		c.entries[host] = proxyDNSResult{
+			addresses: addresses,
+			err:       err,
+			expiresAt: c.now().Add(ttl),
+		}
 	}
-	ttl := proxyDNSTTL
-	if err != nil || len(addresses) == 0 {
-		ttl = proxyTimeout
-	}
-	c.entries[host] = proxyDNSResult{
-		addresses: addresses,
-		err:       err,
-		expiresAt: c.now().Add(ttl),
-	}
-	return addresses, err
+	delete(c.flights, host)
+	flight.addresses, flight.err = addresses, err
+	close(flight.done)
+	c.mu.Unlock()
 }
 
 func singleHeader(r *http.Request, name string) (string, error) {
