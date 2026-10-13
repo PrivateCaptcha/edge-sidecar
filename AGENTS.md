@@ -2,7 +2,7 @@
 
 - Prefer Makefile targets instead of invoking `go`, `npm`, or other build/test tooling directly.
 - If external Go dependencies change, run `make vendors`.
-- If unsure which command to use, check `Makefile`, `.github/workflows/ci.yaml`, and `docker/`.
+- If unsure which command to use, check `Makefile`, `.github/workflows/ci.yml`, and `docker/`.
 
 ## Code
 
