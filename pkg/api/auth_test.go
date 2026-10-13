@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -261,6 +262,31 @@ func TestEdgeSidecarIssuerNormalization(t *testing.T) {
 			f.a.auth(w, authRequest(f.token(t, jwt.MapClaims{"iss": tc.issue}, nil)))
 			if w.Code != http.StatusUnauthorized {
 				t.Fatalf("raw (non-canonical) issuer token should be rejected after normalization: status=%d", w.Code)
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarIssuedAtLeeway(t *testing.T) {
+	f := newEdgeFixture(t)
+	ctx := context.Background()
+	leeway := int64(tokenLeeway / time.Second)
+	now := time.Now().Unix()
+	for _, tc := range []struct {
+		name string
+		iat  int64
+		want denialReason
+	}{
+		{"Current", now, ""},
+		{"WithinLeeway", now + leeway, ""},
+		{"JustWithinLeeway", now + leeway - 1, ""},
+		{"BeyondLeeway", now + leeway + 10, reasonNotYetValid},
+		{"FarFuture", now + 60, reasonNotYetValid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, reason := f.a.verify(ctx, f.token(t, jwt.MapClaims{"iat": tc.iat}, nil), "example.com")
+			if reason != tc.want {
+				t.Fatalf("got reason %q, want %q", reason, tc.want)
 			}
 		})
 	}

@@ -82,6 +82,7 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 			jwt.WithAudience(s.sitekey),
 			jwt.WithExpirationRequired(),
 			jwt.WithIssuedAt(),
+			jwt.WithLeeway(tokenLeeway),
 			jwt.WithStrictDecoding(),
 		),
 	}
@@ -214,6 +215,8 @@ func (a *Authorizer) verify(ctx context.Context, raw, host string) (*edgeClaims,
 			return nil, reasonBadSignature
 		case errors.Is(err, jwt.ErrTokenExpired):
 			return nil, reasonExpired
+		case errors.Is(err, jwt.ErrTokenUsedBeforeIssued), errors.Is(err, jwt.ErrTokenNotValidYet):
+			return nil, reasonNotYetValid
 		case errors.Is(err, jwt.ErrTokenInvalidAudience):
 			return nil, reasonBadAudience
 		case errors.Is(err, jwt.ErrTokenInvalidIssuer):

@@ -143,6 +143,7 @@ func TestEdgeSidecarCompletionFailures(t *testing.T) {
 		{"InvalidToken", 200, `{"success":true,"edge_token":"invalid"}`, 401},
 		{"ExpiredToken", 200, `{"success":true,"edge_token":"` + f.token(t, jwt.MapClaims{"exp": time.Now().Add(-time.Minute).Unix()}, nil) + `"}`, 401},
 		{"WrongAudience", 200, `{"success":true,"edge_token":"` + f.token(t, jwt.MapClaims{"aud": "wrong"}, nil) + `"}`, 401},
+		{"FarFutureToken", 200, `{"success":true,"edge_token":"` + f.token(t, jwt.MapClaims{"iat": time.Now().Add(time.Minute).Unix()}, nil) + `"}`, 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -257,5 +258,30 @@ func TestEdgeSidecarCompletionConcurrency(t *testing.T) {
 	reconfigured.complete(recovered, completionRequest(proofForm(fixtureProof)))
 	if recovered.Code != http.StatusUnauthorized || calls.Load() != 3 {
 		t.Fatal("finished completions did not release their concurrency slots")
+	}
+}
+
+func TestEdgeSidecarCompletionClockSkew(t *testing.T) {
+	f := newEdgeFixture(t)
+	skew := int64(tokenLeeway/time.Second) / 2
+	futureToken := f.token(t, jwt.MapClaims{"iat": time.Now().Unix() + skew}, nil)
+	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(common.HeaderContentType, common.ContentTypeJSON)
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "edge_token": futureToken})
+	}))
+	r := completionRequest(proofForm(fixtureProof))
+	w := httptest.NewRecorder()
+	f.a.complete(w, r)
+	if w.Code != 204 {
+		t.Fatalf("clock-skewed edge token rejected: status=%d body=%q", w.Code, w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Value != futureToken {
+		t.Fatalf("edge cookie not issued for clock-skewed token: cookies=%d", len(cookies))
+	}
+	allowed := httptest.NewRecorder()
+	f.a.auth(allowed, authRequest(cookies[0].Value))
+	if allowed.Code != 204 {
+		t.Fatalf("clock-skewed edge cookie did not authorize locally: status=%d", allowed.Code)
 	}
 }

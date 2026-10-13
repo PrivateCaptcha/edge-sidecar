@@ -30,6 +30,7 @@ const (
 	maxGateBytes   = 1024 * 1024
 	maxRequestURI  = 2048
 	maxTokenTTL    = 24 * time.Hour
+	tokenLeeway    = 5 * time.Second
 	requestTimeout = 8 * time.Second
 	fetchTimeout   = 5 * time.Second
 	proxyTimeout   = time.Second
@@ -90,4 +91,5 @@ const (
 	reasonUnsuccessful      denialReason = "unsuccessful"
 	reasonMissingEdgeToken  denialReason = "missing_edge_token"
 	reasonInvalidCookie     denialReason = "invalid_cookie"
+	reasonNotYetValid       denialReason = "not_yet_valid"
 )
