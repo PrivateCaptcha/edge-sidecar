@@ -44,6 +44,10 @@ func testEnv() map[string]string {
 }
 
 func newEdgeFixture(t *testing.T) *edgeFixture {
+	return newEdgeFixtureWithEnv(t, nil)
+}
+
+func newEdgeFixtureWithEnv(t *testing.T, overrides map[string]string) *edgeFixture {
 	t.Helper()
 	f := &edgeFixture{}
 	var err error
@@ -73,6 +77,9 @@ func newEdgeFixture(t *testing.T) *edgeFixture {
 	}))
 	t.Cleanup(upstream.Close)
 	env := testEnv()
+	for name, value := range overrides {
+		env[name] = value
+	}
 	env["PC_JWKS_URL"] = upstream.URL + "/.well-known/jwks.json"
 	f.s, err = LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
 	if err != nil {
@@ -227,5 +234,34 @@ func TestEdgeSidecarJWT(t *testing.T) {
 	f.a.auth(w, authRequest(raw))
 	if w.Code != 401 {
 		t.Fatal("unsigned token accepted")
+	}
+}
+
+func TestEdgeSidecarIssuerNormalization(t *testing.T) {
+	const canonical = "https://api.privatecaptcha.com"
+	for _, tc := range []struct {
+		name  string
+		issue string
+	}{
+		{"TrailingSlash", "https://api.privatecaptcha.com/"},
+		{"UppercaseScheme", "HTTPS://api.privatecaptcha.com"},
+		{"MissingScheme", "api.privatecaptcha.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEdgeFixtureWithEnv(t, map[string]string{"PC_ISSUER": tc.issue})
+			if f.s.issuer != canonical {
+				t.Fatalf("configured issuer not normalized: got %q want %q", f.s.issuer, canonical)
+			}
+			w := httptest.NewRecorder()
+			f.a.auth(w, authRequest(f.token(t, jwt.MapClaims{"iss": canonical}, nil)))
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("canonical issuer token rejected with non-canonical PC_ISSUER=%q: status=%d body=%q", tc.issue, w.Code, w.Body.String())
+			}
+			w = httptest.NewRecorder()
+			f.a.auth(w, authRequest(f.token(t, jwt.MapClaims{"iss": tc.issue}, nil)))
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("raw (non-canonical) issuer token should be rejected after normalization: status=%d", w.Code)
+			}
+		})
 	}
 }
