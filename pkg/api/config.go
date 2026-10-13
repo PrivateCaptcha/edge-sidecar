@@ -91,18 +91,20 @@ func LoadSettings(cfg common.ConfigStore) (Settings, error) {
 	if s.sitekey == "" || len(s.sitekey) > 128 || strings.ContainsAny(s.sitekey, " \t\r\n") {
 		return Settings{}, errors.New("PC_SITEKEY must be a nonempty sitekey")
 	}
-	for key, raw := range map[common.ConfigKey]string{
-		jwksURLKey:           s.jwksURL,
-		issuerKey:            s.issuer,
-		common.APIBaseURLKey: s.apiBaseURL,
+	for key, item := range map[common.ConfigKey]struct{ raw, name string }{
+		jwksURLKey:           {raw: s.jwksURL, name: "PC_JWKS_URL"},
+		issuerKey:            {raw: s.issuer, name: "PC_ISSUER"},
+		common.APIBaseURLKey: {raw: s.apiBaseURL, name: "PC_API_BASE_URL"},
 	} {
-		parsed, err := upstreamURL(key, raw)
+		parsed, err := upstreamURL(key, item.raw)
 		if err != nil {
-			return Settings{}, fmt.Errorf("invalid upstream URL configuration: %w", err)
+			return Settings{}, fmt.Errorf("invalid upstream URL configuration for %s: %w", item.name, err)
 		}
 		switch key {
 		case jwksURLKey:
 			s.jwksURL = parsed
+		case issuerKey:
+			s.issuer = parsed
 		case common.APIBaseURLKey:
 			s.apiBaseURL = parsed
 		}

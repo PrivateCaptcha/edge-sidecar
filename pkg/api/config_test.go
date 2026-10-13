@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/config"
@@ -102,6 +103,60 @@ func TestEdgeSidecarConfigProxyServiceName(t *testing.T) {
 			}
 			if tc.valid && (len(s.trustedProxies) != 0 || len(s.trustedProxyHosts) == 0) {
 				t.Fatal("hostname-only proxy trust was not configured")
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarConfigIssuerNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		set   bool
+		want  string
+	}{
+		{"Default", "", false, "https://api.privatecaptcha.com"},
+		{"Canonical", "https://api.privatecaptcha.com", true, "https://api.privatecaptcha.com"},
+		{"TrailingSlash", "https://api.privatecaptcha.com/", true, "https://api.privatecaptcha.com"},
+		{"UppercaseScheme", "HTTPS://api.privatecaptcha.com", true, "https://api.privatecaptcha.com"},
+		{"MissingScheme", "api.privatecaptcha.com", true, "https://api.privatecaptcha.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv()
+			if tc.set {
+				env["PC_ISSUER"] = tc.value
+			}
+			s, err := LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.issuer != tc.want {
+				t.Fatalf("issuer=%q want=%q", s.issuer, tc.want)
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarConfigIssuerInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"NonHTTPS", "http://api.privatecaptcha.com"},
+		{"WithQuery", "https://api.privatecaptcha.com?x=1"},
+		{"WithFragment", "https://api.privatecaptcha.com#frag"},
+		{"WithCredentials", "https://user@api.privatecaptcha.com"},
+		{"EmptyHost", "https://"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv()
+			env["PC_ISSUER"] = tc.value
+			_, err := LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
+			if err == nil {
+				t.Fatal("invalid PC_ISSUER accepted")
+			}
+			if !strings.Contains(err.Error(), "PC_ISSUER") {
+				t.Fatalf("error does not name PC_ISSUER: %v", err)
 			}
 		})
 	}
