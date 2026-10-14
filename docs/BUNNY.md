@@ -1,4 +1,4 @@
-# PrivateCaptcha for Bunny CDN — User Manual
+# Bunny CDN
 
 PrivateCaptcha Bunny Middleware protects an existing Bunny Pull Zone with a CAPTCHA before visitors can access your website. Visitors solve the challenge once, receive a secure browser cookie, and can browse until their **edge token expires**. No application changes are required.
 
