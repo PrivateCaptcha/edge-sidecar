@@ -69,6 +69,7 @@ type denialReason string
 const (
 	reasonMissing           denialReason = "missing"
 	reasonExpired           denialReason = "expired"
+	reasonCookieUseLimit    denialReason = "cookie_use_limit"
 	reasonMalformed         denialReason = "malformed"
 	reasonMalformedRequest  denialReason = "malformed_request"
 	reasonBadForwarded      denialReason = "bad_forwarded"

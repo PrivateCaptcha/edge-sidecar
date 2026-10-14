@@ -36,6 +36,22 @@ func TestEdgeSidecarConfig(t *testing.T) {
 			name:  "PC_MAX_CONCURRENT_COMPLETIONS",
 			value: "999999999999999999999999",
 		},
+		{
+			name:  "PC_MAX_COOKIE_USES",
+			value: "0",
+		},
+		{
+			name:  "PC_MAX_COOKIE_USES",
+			value: "-1",
+		},
+		{
+			name:  "PC_MAX_COOKIE_USES",
+			value: "invalid",
+		},
+		{
+			name:  "PC_MAX_COOKIE_USES",
+			value: "999999999999999999999999",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testEnv()
@@ -73,6 +89,36 @@ func TestEdgeSidecarConfigCompletionConcurrency(t *testing.T) {
 			}
 			if s.maxConcurrentCompletions != tc.want {
 				t.Fatalf("concurrency=%d want=%d", s.maxConcurrentCompletions, tc.want)
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarConfigCookieUses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  int64
+	}{
+		{
+			name: "Default",
+			want: 100,
+		},
+		{
+			name:  "Configured",
+			value: "7",
+			want:  7,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv()
+			env["PC_MAX_COOKIE_USES"] = tc.value
+			s, err := LoadSettings(config.NewEnvConfig(func(name string) string { return env[name] }))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.maxCookieUses != tc.want {
+				t.Fatalf("cookie uses=%d want=%d", s.maxCookieUses, tc.want)
 			}
 		})
 	}

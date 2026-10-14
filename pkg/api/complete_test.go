@@ -47,7 +47,7 @@ func proofForm(proof string) string {
 }
 
 func TestEdgeSidecarCompletionCookie(t *testing.T) {
-	f := newEdgeFixture(t)
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "1"})
 	token := f.token(t, nil, nil)
 	var calls atomic.Int32
 	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +82,11 @@ func TestEdgeSidecarCompletionCookie(t *testing.T) {
 	f.a.auth(allowed, authRequest(cookie.Value))
 	if allowed.Code != 204 || calls.Load() != 1 || f.jwksCalls.Load() != 1 {
 		t.Fatal("cookie did not authorize locally")
+	}
+	denied := httptest.NewRecorder()
+	f.a.auth(denied, authRequest(cookie.Value))
+	if denied.Code != http.StatusUnauthorized || calls.Load() != 1 {
+		t.Fatal("completion cookie exceeded its usage allowance")
 	}
 }
 

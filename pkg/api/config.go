@@ -25,6 +25,7 @@ const (
 	trustedProxiesKey
 	trustedProxyHostsKey
 	maxConcurrentCompletionsKey
+	maxCookieUsesKey
 )
 
 type Settings struct {
@@ -40,6 +41,7 @@ type Settings struct {
 	trustedProxyHosts        []string
 	lookupProxy              func(context.Context, string, string) ([]netip.Addr, error)
 	maxConcurrentCompletions int
+	maxCookieUses            int64
 	proxyDNS                 *proxyDNSCache
 }
 
@@ -54,6 +56,7 @@ func RegisterConfig() error {
 		trustedProxiesKey:           "PC_TRUSTED_PROXY_CIDRS",
 		trustedProxyHostsKey:        "PC_TRUSTED_PROXY_HOSTS",
 		maxConcurrentCompletionsKey: "PC_MAX_CONCURRENT_COMPLETIONS",
+		maxCookieUsesKey:            "PC_MAX_COOKIE_USES",
 	} {
 		if err := config.RegisterEnvNameForConfigKey(key, name); err != nil {
 			return err
@@ -77,6 +80,10 @@ func LoadSettings(cfg common.ConfigStore) (Settings, error) {
 	if err != nil || maxCompletions < 1 {
 		return Settings{}, errors.New("PC_MAX_CONCURRENT_COMPLETIONS must be a positive integer")
 	}
+	maxCookieUses, err := strconv.ParseInt(value(maxCookieUsesKey, "100"), 10, 64)
+	if err != nil || maxCookieUses < 1 {
+		return Settings{}, errors.New("PC_MAX_COOKIE_USES must be a positive integer")
+	}
 	s := Settings{
 		Address:                  net.JoinHostPort(value(common.HostKey, "localhost"), port),
 		jwksURL:                  value(jwksURLKey, "https://api.privatecaptcha.com"+jwksPath),
@@ -87,6 +94,7 @@ func LoadSettings(cfg common.ConfigStore) (Settings, error) {
 		apiKey:                   value(apiKeyKey, ""),
 		lookupProxy:              net.DefaultResolver.LookupNetIP,
 		maxConcurrentCompletions: maxCompletions,
+		maxCookieUses:            maxCookieUses,
 	}
 	if s.sitekey == "" || len(s.sitekey) > 128 || strings.ContainsAny(s.sitekey, " \t\r\n") {
 		return Settings{}, errors.New("PC_SITEKEY must be a nonempty sitekey")

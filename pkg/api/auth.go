@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
@@ -15,6 +17,8 @@ import (
 	pc "github.com/PrivateCaptcha/private-captcha-go"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/justinas/alice"
+	"github.com/maypok86/otter/v2"
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/net/idna"
 )
 
@@ -39,13 +43,14 @@ type Authorizer struct {
 	gates           *gateCache
 	verifier        *pc.Client
 	completionLimit *completionLimiter
+	cookieUses      *otter.Cache[int64, *int64]
 }
 
 func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
-	return newAuthorizer(s, keys, nil, nil)
+	return newAuthorizer(s, keys, nil, nil, nil)
 }
 
-func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimiter, rateLimiter ratelimit.HTTPRateLimiter) (*Authorizer, error) {
+func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimiter, rateLimiter ratelimit.HTTPRateLimiter, cookieUses *otter.Cache[int64, *int64]) (*Authorizer, error) {
 	s.proxyDNS = &proxyDNSCache{
 		entries: make(map[string]proxyDNSResult, len(s.trustedProxyHosts)),
 		now:     time.Now,
@@ -70,12 +75,20 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 	if rateLimiter == nil {
 		rateLimiter = ratelimit.NewIPAddrRateLimiter(common.HeaderClientIP, ratelimit.NewIPAddrBuckets(10_000, 10, 6*time.Second))
 	}
+	if cookieUses == nil {
+		cookieUses = otter.Must(&otter.Options[int64, *int64]{
+			MaximumSize:      100_000,
+			InitialCapacity:  1_000,
+			ExpiryCalculator: otter.ExpiryCreating[int64, *int64](maxTokenTTL + 2*tokenLeeway),
+		})
+	}
 	a := &Authorizer{
 		s:               s,
 		keys:            keys,
 		verifier:        verifier,
 		completionLimit: completionLimit,
 		rateLimiter:     rateLimiter,
+		cookieUses:      cookieUses,
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{keyAlgorithm}),
 			jwt.WithIssuer(s.issuer),
@@ -94,13 +107,13 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 	}
 	slog.Debug("Configured edge authorizer", "protected_origin", s.protectedOrigin,
 		"trusted_proxy_cidrs", s.trustedProxies, "trusted_proxy_hosts", s.trustedProxyHosts,
-		"max_concurrent_completions", s.maxConcurrentCompletions)
+		"max_concurrent_completions", s.maxConcurrentCompletions, "max_cookie_uses", s.maxCookieUses)
 	return a, nil
 }
 
 // Reconfigure builds a replacement while retaining admission limits for in-flight requests.
 func (a *Authorizer) Reconfigure(s Settings, keys *KeyCache) (*Authorizer, error) {
-	next, err := newAuthorizer(s, keys, a.completionLimit, a.rateLimiter)
+	next, err := newAuthorizer(s, keys, a.completionLimit, a.rateLimiter, a.cookieUses)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +133,7 @@ func (a *Authorizer) auth(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if reason := a.validate(r); reason != "" {
 		level := slog.LevelWarn
-		if reason == reasonMissing || reason == reasonExpired {
+		if reason == reasonMissing || reason == reasonExpired || reason == reasonCookieUseLimit {
 			level = slog.LevelDebug
 		}
 		navigation := browserNavigation(r)
@@ -181,7 +194,21 @@ func (a *Authorizer) validate(r *http.Request) denialReason {
 	}
 	slog.Log(r.Context(), common.LevelTrace, "Checking edge authorization cookie", "endpoint", authPath)
 	_, reason := a.verify(r.Context(), cookies[0].Value, host)
-	return reason
+	if reason != "" {
+		return reason
+	}
+	digest := blake2b.Sum256([]byte(cookies[0].Value))
+	key := int64(binary.LittleEndian.Uint64(digest[:8]))
+	counter, _ := a.cookieUses.ComputeIfAbsent(key, func() (*int64, bool) {
+		return new(int64), false
+	})
+	if count := atomic.AddInt64(counter, 1); count > a.s.maxCookieUses {
+		atomic.AddInt64(counter, -1)
+		slog.DebugContext(r.Context(), "Edge authorization cookie usage limit exceeded", "endpoint", authPath,
+			"cookie_uses", count-1, "max_cookie_uses", a.s.maxCookieUses)
+		return reasonCookieUseLimit
+	}
+	return ""
 }
 
 func (a *Authorizer) verify(ctx context.Context, raw, host string) (*edgeClaims, denialReason) {

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -178,6 +179,185 @@ func TestEdgeSidecarProxy(t *testing.T) {
 	}
 	if f.jwksCalls.Load() != 1 {
 		t.Fatal("normal authorization contacted JWKS")
+	}
+}
+
+func TestEdgeSidecarCookieUses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{
+			name:  "Default",
+			limit: 100,
+		},
+		{
+			name:  "Configured",
+			value: "2",
+			limit: 2,
+		},
+		{
+			name:  "SingleUse",
+			value: "1",
+			limit: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": tc.value})
+			token := f.token(t, nil, nil)
+			for i := 0; i < tc.limit+2; i++ {
+				w := httptest.NewRecorder()
+				f.a.auth(w, authRequest(token))
+				want := http.StatusNoContent
+				if i >= tc.limit {
+					want = http.StatusUnauthorized
+				}
+				if w.Code != want || w.Body.Len() != 0 || w.Header().Get(common.HeaderCacheControl) != cacheNoStore {
+					t.Fatalf("request %d: status=%d want=%d body=%q headers=%v", i+1, w.Code, want, w.Body.String(), w.Header())
+				}
+			}
+			w := httptest.NewRecorder()
+			f.a.auth(w, authRequest(f.token(t, jwt.MapClaims{"jti": "renewed"}, nil)))
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("new cookie did not receive its own allowance: status=%d", w.Code)
+			}
+			if f.jwksCalls.Load() != 1 {
+				t.Fatal("cookie usage checks contacted JWKS")
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarCookieUsesConcurrent(t *testing.T) {
+	const limit = 17
+	const requests = 64
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "17"})
+	token := f.token(t, nil, nil)
+	var allowed atomic.Int64
+	var denied atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			w := httptest.NewRecorder()
+			f.a.auth(w, authRequest(token))
+			switch w.Code {
+			case http.StatusNoContent:
+				allowed.Add(1)
+			case http.StatusUnauthorized:
+				denied.Add(1)
+			default:
+				t.Errorf("unexpected authorization status=%d", w.Code)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if allowed.Load() != limit || denied.Load() != requests-limit {
+		t.Fatalf("allowed=%d denied=%d want=%d/%d", allowed.Load(), denied.Load(), limit, requests-limit)
+	}
+}
+
+func TestEdgeSidecarCookieUsesDeniedRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*http.Request)
+	}{
+		{
+			name: "UntrustedProxy",
+			edit: func(r *http.Request) { r.RemoteAddr = "192.0.2.10:8080" },
+		},
+		{
+			name: "WrongOrigin",
+			edit: func(r *http.Request) { r.Header.Set(HeaderForwardedHost, "other.example") },
+		},
+		{
+			name: "MalformedRequest",
+			edit: func(r *http.Request) { r.ContentLength = 1 },
+		},
+		{
+			name: "DuplicateCookie",
+			edit: func(r *http.Request) { r.Header.Add(HeaderCookie, r.Header.Get(HeaderCookie)) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "1"})
+			token := f.token(t, nil, nil)
+			r := authRequest(token)
+			tc.edit(r)
+			w := httptest.NewRecorder()
+			f.a.auth(w, r)
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("invalid request returned status=%d", w.Code)
+			}
+			if reason := f.a.validate(authRequest(token)); reason != "" {
+				t.Fatalf("denied request consumed a cookie use: reason=%q", reason)
+			}
+			if reason := f.a.validate(authRequest(token)); reason != reasonCookieUseLimit {
+				t.Fatalf("cookie allowance was not exhausted: reason=%q", reason)
+			}
+		})
+	}
+}
+
+func TestEdgeSidecarCookieUsesVerification(t *testing.T) {
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "1"})
+	token := f.token(t, nil, nil)
+	for i := 0; i < 2; i++ {
+		if _, reason := f.a.verify(t.Context(), token, "example.com"); reason != "" {
+			t.Fatalf("token verification failed: reason=%q", reason)
+		}
+	}
+	if reason := f.a.validate(authRequest(token)); reason != "" {
+		t.Fatalf("token verification consumed a cookie use: reason=%q", reason)
+	}
+	if reason := f.a.validate(authRequest(token)); reason != reasonCookieUseLimit {
+		t.Fatalf("cookie allowance was not exhausted: reason=%q", reason)
+	}
+	if _, reason := f.a.verify(t.Context(), token, "example.com"); reason != "" {
+		t.Fatalf("cookie usage affected token verification: reason=%q", reason)
+	}
+}
+
+func TestEdgeSidecarCookieUsesReconfigure(t *testing.T) {
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "3"})
+	token := f.token(t, nil, nil)
+	for i := 0; i < 2; i++ {
+		if reason := f.a.validate(authRequest(token)); reason != "" {
+			t.Fatalf("request %d denied: reason=%q", i+1, reason)
+		}
+	}
+	updated := f.s
+	updated.maxCookieUses = 4
+	reconfigured, err := f.a.Reconfigure(updated, f.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if reason := reconfigured.validate(authRequest(token)); reason != "" {
+			t.Fatalf("reload did not apply the increased limit: reason=%q", reason)
+		}
+	}
+	if reason := reconfigured.validate(authRequest(token)); reason != reasonCookieUseLimit {
+		t.Fatalf("reload reset cookie uses: reason=%q", reason)
+	}
+	if reason := f.a.validate(authRequest(token)); reason != reasonCookieUseLimit {
+		t.Fatalf("old authorizer did not share cookie uses with the replacement: reason=%q", reason)
+	}
+	updated.maxCookieUses = 5
+	reconfigured, err = reconfigured.Reconfigure(updated, f.keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := reconfigured.validate(authRequest(token)); reason != "" {
+		t.Fatalf("denied requests consumed cookie uses: reason=%q", reason)
+	}
+	if reason := reconfigured.validate(authRequest(token)); reason != reasonCookieUseLimit {
+		t.Fatalf("cookie allowance was not exhausted after reload: reason=%q", reason)
 	}
 }
 

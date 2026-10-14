@@ -17,7 +17,7 @@ import (
 )
 
 func TestEdgeSidecarProxyServiceName(t *testing.T) {
-	f := newEdgeFixture(t)
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "200"})
 	f.a.s.trustedProxies = nil
 	f.a.s.trustedProxyHosts = []string{"caddy"}
 	now := time.Now()

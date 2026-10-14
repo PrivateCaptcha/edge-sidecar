@@ -42,6 +42,8 @@ Browser -> proxy -> GET /auth
 
 Known-key JWT checks are local. Keys are fetched at startup, refreshed periodically, and refreshed once on an unknown `kid`. Failed refreshes retain cached keys. Gate HTML is cached according to upstream freshness, but browser challenges always use `Cache-Control: no-store`. Non-navigation requests get an empty `401`.
 
+Each cookie authorizes up to `PC_MAX_COOKIE_USES` requests per sidecar process. Exhausted cookies require a new CAPTCHA verification and receive the normal `401` response or hosted challenge. Counters use a bounded in-memory cache, survive configuration reloads, and reset on process restart or cache eviction.
+
 The hosted gate owns submission/reload JavaScript and CSP. The sidecar passes HTML/CSP through unchanged.
 
 nginx uses a status-only auth subrequest, then a second internal `/auth` request on denial to return the full response at the original browser URL.
@@ -78,6 +80,7 @@ See [TESTING.md](docs/TESTING.md) for Docker setup.
 | `PC_JWKS_URL` | `https://api.privatecaptcha.com/.well-known/jwks.json`; fixed URL, no redirects. |
 | `PC_JWKS_REFRESH_INTERVAL` | `5m`; Go duration between `1s` and `24h`. |
 | `PC_MAX_CONCURRENT_COMPLETIONS` | `512`; positive integer limiting concurrent completions per process. Saturation returns `429` with `Retry-After` before reading the form. |
+| `PC_MAX_COOKIE_USES` | `100`; positive integer limiting successful authorizations per cookie per process. |
 | `PC_HOST`, `PC_PORT` | `localhost`, `8080`; demo binds privately on `0.0.0.0`. |
 | `STAGE`, `PC_VERBOSE` | Shared logging settings. |
 

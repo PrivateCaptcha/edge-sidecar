@@ -81,7 +81,7 @@ func navigationRequest(token string) *http.Request {
 }
 
 func TestEdgeSidecarGateChallenge(t *testing.T) {
-	f := newEdgeFixture(t)
+	f := newEdgeFixtureWithEnv(t, map[string]string{"PC_MAX_COOKIE_USES": "1"})
 	body, csp := hostedGate(t, f.s.sitekey)
 	var calls atomic.Int32
 	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,9 +114,16 @@ func TestEdgeSidecarGateChallenge(t *testing.T) {
 		}
 	}
 	w := httptest.NewRecorder()
-	f.a.auth(w, navigationRequest(f.token(t, nil, nil)))
+	token := f.token(t, nil, nil)
+	f.a.auth(w, navigationRequest(token))
 	if w.Code != 204 || calls.Load() != 1 {
 		t.Fatal("valid cookie fetched challenge or challenge cache was not reused")
+	}
+	w = httptest.NewRecorder()
+	f.a.auth(w, navigationRequest(token))
+	if w.Code != http.StatusUnauthorized || !bytes.Equal(w.Body.Bytes(), body) ||
+		w.Header().Get(common.HeaderCacheControl) != cacheNoStore || calls.Load() != 1 {
+		t.Fatal("exhausted cookie did not receive the cached challenge")
 	}
 }
 
