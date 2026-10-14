@@ -12,10 +12,11 @@ CAPTCHA [settings](https://docs.privatecaptcha.com/docs/reference/property-setti
 
 ## Usage
 
-Web server | Link
+Platform | Link
 --- | ---
 Caddy | [guide](docs/CADDY.md)
 nginx | [guide](docs/NGINX.md)
+Bunny CDN | [guide](docs/BUNNY.md)
 Docker | [guide](docs/DOCKER.md)
 
 ## Flow
