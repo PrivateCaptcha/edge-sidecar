@@ -1,5 +1,5 @@
 [Unit]
-Description=Edge sidecar
+Description=Edge sidecar (%i)
 After=network.target
 # optional: add caddy.service (if you use caddy) to After above
 [Service]
@@ -12,9 +12,9 @@ KillMode=control-group
 Restart=on-failure
 RestartSec=5s
 # Hardening
-CacheDirectory=edgesidecar
-RuntimeDirectory=edgesidecar
-LoadCredential=pc.env:/etc/edgesidecar/env.conf
+CacheDirectory=edgesidecar-%i
+RuntimeDirectory=edgesidecar-%i
+LoadCredential=pc.env:/etc/edgesidecar/%i.conf
 DynamicUser=true
 PrivateUsers=true
 PrivateDevices=true

@@ -31,6 +31,8 @@ PC_TRUSTED_PROXY_CIDRS=127.0.0.1/32
 
 Use an enabled property for `example.com` with edge tokens enabled, and an API key with puzzle scope. See [configuration](../README.md#configuration) for all settings.
 
+For systemd, save these settings as `/etc/edgesidecar/example.conf` and run `edge-sidecar@example.service` using the [template service guide](SYSTEMD.md). Give each additional instance a distinct listening address/port combination and nginx upstream name, and use that site's instance for the auth, gate, and completion upstreams.
+
 ## nginx configuration example
 
 Save this shared snippet as `/etc/nginx/snippets/privatecaptcha-sidecar.conf`:
