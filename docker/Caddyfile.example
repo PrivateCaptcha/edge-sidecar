@@ -17,7 +17,8 @@
 
 	handle {
 		forward_auth {$PC_AUTH_UPSTREAM:privatecaptcha-authorizer:8080} {
-			uri /auth
+			uri /auth?
+			copy_headers X-PC-Referer>Referer
 			header_up X-Forwarded-Host {http.request.hostport}
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-Uri {uri}

@@ -59,7 +59,9 @@ func TestEdgeSidecarFlow(t *testing.T) {
 		check := httptest.NewRecorder()
 		router.ServeHTTP(check, auth)
 		if check.Code == 204 {
+			r.Header.Set(common.HeaderReferer, check.Header().Get(HeaderAuthReferer))
 			appCalls.Add(1)
+			w.Header().Set("X-Demo-Referer", r.Referer())
 			io.WriteString(w, "application reached")
 			return
 		}
@@ -72,19 +74,23 @@ func TestEdgeSidecarFlow(t *testing.T) {
 	t.Cleanup(gateway.Close)
 	client := gateway.Client()
 	client.Jar, _ = cookiejar.New(nil)
-	navigate := func() *http.Response {
+	navigate := func(referer string) *http.Response {
 		t.Helper()
 		r, _ := http.NewRequest(http.MethodGet, gateway.URL+"/private?demo=1", nil)
 		r.Host = "example.com"
 		r.Header = navigationRequest("").Header.Clone()
 		r.Header.Set(HeaderForwardedHost, "attacker.example")
+		if referer != "" {
+			r.Header.Set(common.HeaderReferer, referer)
+		}
 		response, err := client.Do(r)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return response
 	}
-	response := navigate()
+	const referer = "https://referrer.example/"
+	response := navigate(referer)
 	challenge, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 	if response.StatusCode != 401 || string(challenge) != string(body) || appCalls.Load() != 0 || verifyCalls.Load() != 0 {
@@ -101,10 +107,18 @@ func TestEdgeSidecarFlow(t *testing.T) {
 	if response.StatusCode != 204 || len(response.Cookies()) != 1 || appCalls.Load() != 0 {
 		t.Fatal("completion did not bypass auth and issue cookie")
 	}
-	response = navigate()
+	response = navigate("")
 	allowed, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 	if response.StatusCode != 200 || string(allowed) != "application reached" || appCalls.Load() != 1 || gateCalls.Load() != 1 || verifyCalls.Load() != 1 || f.jwksCalls.Load() != 1 {
 		t.Fatal("cookie did not permit application access with local verification")
+	}
+	if response.Header.Get("X-Demo-Referer") != referer {
+		t.Fatal("challenge completion lost the original referrer")
+	}
+	response = navigate("")
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Demo-Referer") != "" {
+		t.Fatal("later navigation reused the original referral context")
 	}
 }

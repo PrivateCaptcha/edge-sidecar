@@ -8,6 +8,8 @@ Use the built-in [forward_auth](https://caddyserver.com/docs/caddyfile/directive
 2. A `401` is returned to the browser with the sidecar's body and headers. Browser navigations receive hosted captcha HTML and CSP at the original URL; non-navigation requests receive an empty response.
 3. `/__privatecaptcha/complete` bypasses auth and proxies directly to the sidecar. It verifies the proof, sets the edge cookie, and returns `204`. The hosted page reloads the original URL.
 
+For challenged navigations, the sidecar caches the incoming referrer and sets an opaque, short-lived context cookie. On the first matching authorized reload, `copy_headers X-PC-Referer>Referer` restores the application's `Referer` header. Other authorized requests retain their incoming referrer. See [referrer preservation](../README.md#referrer-preservation) for cache scope and limits.
+
 Caddy overwrites forwarded host, scheme, method, URI, and `X-PC-Client-IP`. The sidecar validates the actual connection peer and configured HTTPS origin. Keep it private and trust Caddy's actual peer IP/CIDR, or use `PC_TRUSTED_PROXY_HOSTS=caddy` for a container deployment. Other `/__privatecaptcha/*` paths return `404`.
 
 ## Configure the sidecar
@@ -54,8 +56,9 @@ example.com {
 
         # Protected website
         handle {
-            forward_auth 127.0.0.1:34635 {
-                uri /auth
+            forward_auth 127.0.0.1:8080 {
+                uri /auth?
+                copy_headers X-PC-Referer>Referer
                 header_up X-Forwarded-Host {http.request.hostport}
                 header_up X-Forwarded-Proto {scheme}
                 header_up X-Forwarded-Uri {uri}
@@ -74,6 +77,8 @@ example.com {
 ```
 
 Keep application handlers inside the final `handle` block, after `forward_auth`.
+
+The trailing `?` in `uri /auth?` clears the query string only on the auth request. The full original URI remains in `X-Forwarded-Uri`, and the application receives the original path and query string, including tracking parameters.
 
 ```sh
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

@@ -224,13 +224,20 @@ func gateFreshness(h http.Header, now time.Time, delay time.Duration) (time.Time
 	return now.Add(time.Duration(maxAge)*time.Second - age), true
 }
 
-func browserNavigation(r *http.Request) bool {
+func navigationMetadata(r *http.Request) bool {
 	method, err := singleHeader(r, HeaderForwardedMethod)
 	if err != nil || method != http.MethodGet || r.Header.Get(HeaderXRequestedWith) != "" || r.Header.Get(common.HeaderHtmxRequest) != "" {
 		return false
 	}
 	mode, dest := r.Header.Values(HeaderSecFetchMode), r.Header.Values(HeaderSecFetchDest)
 	if (len(mode) != 0 || len(dest) != 0) && (len(mode) != 1 || len(dest) != 1 || mode[0] != "navigate" || dest[0] != "document") {
+		return false
+	}
+	return true
+}
+
+func browserNavigation(r *http.Request) bool {
+	if !navigationMetadata(r) {
 		return false
 	}
 	for part := range strings.SplitSeq(strings.Join(r.Header.Values(HeaderAccept), ","), ",") {

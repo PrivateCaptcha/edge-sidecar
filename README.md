@@ -48,6 +48,14 @@ The hosted gate owns submission/reload JavaScript and CSP. The sidecar passes HT
 
 nginx uses a status-only auth subrequest, then a second internal `/auth` request on denial to return the full response at the original browser URL.
 
+### Referrer preservation
+
+The proxy examples restore the server-side `Referer` header after a CAPTCHA. The sidecar stores up to 10,000 referral contexts in an Otter cache for five minutes. A Secure, HttpOnly, SameSite=Lax `__Host-privatecaptcha-ref-*` cookie holds only a random context ID. Its name is scoped to a hash of the protected origin and full original URI, including the query string, so challenges for different URLs can coexist across tabs. Tabs challenging the same URL share that URL's cookie.
+
+nginx's status-only auth check suppresses `Accept`, so recovery there requires the browser's `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document` headers.
+
+The browser's native `document.referrer` is not restored, and the challenge keeps its `no-referrer` policy. Referrer data and context IDs are not logged.
+
 ## Run
 
 Build sidecar:

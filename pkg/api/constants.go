@@ -39,6 +39,10 @@ const (
 	gateRetryGap   = 2 * time.Second
 	maxGateTTL     = 24 * time.Hour
 
+	referralTTL     = 5 * time.Minute
+	maxRefererBytes = 4096
+	maxReferralURI  = 8192
+
 	cacheNoStore = "no-store"
 )
 
@@ -62,6 +66,7 @@ var (
 	HeaderSecFetchMode    = http.CanonicalHeaderKey("Sec-Fetch-Mode")
 	HeaderSecFetchDest    = http.CanonicalHeaderKey("Sec-Fetch-Dest")
 	HeaderXRequestedWith  = http.CanonicalHeaderKey("X-Requested-With")
+	HeaderAuthReferer     = http.CanonicalHeaderKey("X-PC-Referer")
 )
 
 type denialReason string
