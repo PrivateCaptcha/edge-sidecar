@@ -44,13 +44,14 @@ type Authorizer struct {
 	verifier        *pc.Client
 	completionLimit *completionLimiter
 	cookieUses      *otter.Cache[int64, *int64]
+	referrals       *otter.Cache[string, referral]
 }
 
 func NewAuthorizer(s Settings, keys *KeyCache) (*Authorizer, error) {
-	return newAuthorizer(s, keys, nil, nil, nil)
+	return newAuthorizer(s, keys, nil, nil, nil, nil)
 }
 
-func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimiter, rateLimiter ratelimit.HTTPRateLimiter, cookieUses *otter.Cache[int64, *int64]) (*Authorizer, error) {
+func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimiter, rateLimiter ratelimit.HTTPRateLimiter, cookieUses *otter.Cache[int64, *int64], referrals *otter.Cache[string, referral]) (*Authorizer, error) {
 	s.proxyDNS = &proxyDNSCache{
 		entries: make(map[string]proxyDNSResult, len(s.trustedProxyHosts)),
 		now:     time.Now,
@@ -82,6 +83,13 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 			ExpiryCalculator: otter.ExpiryCreating[int64, *int64](maxTokenTTL + 2*tokenLeeway),
 		})
 	}
+	if referrals == nil {
+		referrals = otter.Must(&otter.Options[string, referral]{
+			MaximumSize:      10_000,
+			InitialCapacity:  1_000,
+			ExpiryCalculator: otter.ExpiryCreating[string, referral](referralTTL),
+		})
+	}
 	a := &Authorizer{
 		s:               s,
 		keys:            keys,
@@ -89,6 +97,7 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 		completionLimit: completionLimit,
 		rateLimiter:     rateLimiter,
 		cookieUses:      cookieUses,
+		referrals:       referrals,
 		parser: jwt.NewParser(
 			jwt.WithValidMethods([]string{keyAlgorithm}),
 			jwt.WithIssuer(s.issuer),
@@ -113,7 +122,7 @@ func newAuthorizer(s Settings, keys *KeyCache, completionLimit *completionLimite
 
 // Reconfigure builds a replacement while retaining admission limits for in-flight requests.
 func (a *Authorizer) Reconfigure(s Settings, keys *KeyCache) (*Authorizer, error) {
-	next, err := newAuthorizer(s, keys, a.completionLimit, a.rateLimiter, a.cookieUses)
+	next, err := newAuthorizer(s, keys, a.completionLimit, a.rateLimiter, a.cookieUses, a.referrals)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +152,7 @@ func (a *Authorizer) auth(w http.ResponseWriter, r *http.Request) {
 			slog.DebugContext(ctx, "Preparing hosted captcha challenge", "endpoint", authPath)
 			if page, err := a.gates.get(ctx); err == nil {
 				common.WriteHeaders(w, page.headers)
+				a.captureReferrer(w, r)
 				w.WriteHeader(http.StatusUnauthorized)
 				if sent, err := w.Write(page.body); err != nil {
 					slog.DebugContext(ctx, "Failed to send gate response", "endpoint", authPath, "bytes", sent, common.ErrAttr(err))
@@ -160,6 +170,7 @@ func (a *Authorizer) auth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Log(ctx, common.LevelTrace, "Edge authorization succeeded", "endpoint", authPath, "status", http.StatusNoContent)
+	w.Header().Set(HeaderAuthReferer, a.authorizedReferrer(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -7,6 +7,7 @@
 	header X-Demo-Method {method}
 	header X-Demo-URI {uri}
 	header X-Demo-Host {hostport}
+	header X-Demo-Referer {http.request.header.Referer}
 	header X-Demo-Upgrade {http.request.header.Upgrade}
 	header X-Demo-Connection {http.request.header.Connection}
 	respond /echo "{http.request.body}"

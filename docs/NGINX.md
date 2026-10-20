@@ -8,6 +8,8 @@ Use `auth_request` to authorize requests before forwarding them to your applicat
 2. On `401`, `error_page` internally routes to `/__privatecaptcha/gate`. This makes a second bodyless `GET /auth`, preserving browser headers, and returns the full response. Navigation requests receive hosted HTML and CSP; other requests receive an empty `401`. The browser URL never changes.
 3. `/__privatecaptcha/complete` bypasses auth and forwards the proof to the sidecar. Its `Set-Cookie` and `204` reach the browser unchanged, then the hosted page reloads.
 
+For challenged navigations, the sidecar caches the incoming referrer and sets an opaque, short-lived context cookie. `auth_request_set` captures `X-PC-Referer` from successful auth responses, and `proxy_set_header Referer` restores the application's referrer on the first matching authorized reload. Other authorized requests retain their incoming referrer. See [referrer preservation](../README.md#referrer-preservation) for cache scope and limits.
+
 The original method is saved before the auth check because an [error_page redirect](https://nginx.org/en/docs/http/ngx_http_core_module.html#error_page) can change POST to GET. Auth requests omit the body and `Content-Length`, while authorized application requests retain their method, URI, and body. Application errors pass through without invoking the gate, and completion is never retried. WebSocket upgrade headers are forwarded to the application after authorization; the auth subrequests remain ordinary HTTP requests. Configure application ping frames or `proxy_read_timeout` for WebSockets that can remain idle for over 60s.
 
 nginx overwrites the forwarded metadata and client IP. Keep the sidecar private and trust nginx's actual peer IP/CIDR, or use `PC_TRUSTED_PROXY_HOSTS=nginx` for a container deployment. Auth/gate helper locations are internal; other `/__privatecaptcha/*` paths return `404`.
@@ -124,12 +126,14 @@ server {
     location / {
         set $pc_original_method $request_method;
         auth_request /__privatecaptcha/auth;
+        auth_request_set $pc_referer $upstream_http_x_pc_referer;
         error_page 401 = /__privatecaptcha/gate;
         proxy_intercept_errors off;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $pc_connection_upgrade;
         proxy_set_header Host $http_host;
+        proxy_set_header Referer $pc_referer;
         proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -138,7 +142,7 @@ server {
 }
 ```
 
-Repeat `set $pc_original_method`, `auth_request`, and `error_page` in every protected application-serving location you add. Public locations use `auth_request off` instead. The `^~` on `/__privatecaptcha/` keeps reserved paths out of the public regex location; exact auth, gate, and completion locations still take precedence.
+Repeat `set $pc_original_method`, `auth_request`, `auth_request_set`, `proxy_set_header Referer`, and `error_page` in every protected application-serving location you add. Public locations use `auth_request off` instead. The `^~` on `/__privatecaptcha/` keeps reserved paths out of the public regex location; exact auth, gate, and completion locations still take precedence.
 
 ```sh
 nginx -t && nginx -s reload

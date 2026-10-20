@@ -3,15 +3,17 @@ const { test, expect } = require('@playwright/test');
 const completePath = '/__privatecaptcha/complete';
 const cookieName = '__Host-privatecaptcha-edge';
 const applicationText = 'PrivateCaptcha edge demo: application reached.';
+const trackingQuery = 'utm_source=newsletter&utm_medium=email&utm_campaign=fall%20sale&tag=a&tag=b&empty=&flag&plus=a+b&literal=a%2Bb&return=%2Faccount%3Fx%3D1%26y%3D2';
 
 test('solving the hosted challenge authorizes the original URL and subsequent requests', async ({ page, context, baseURL }) => {
   test.setTimeout(120_000);
-  const protectedPath = '/private?demo=playwright&return=%2Faccount#resume';
+  const protectedPath = `/private?${trackingQuery}&long=${'a'.repeat(2100)}#resume`;
   const protectedURL = new URL(protectedPath, baseURL);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
 
-  const challenge = await page.goto(protectedPath);
+  const originalReferer = 'https://referrer.example/';
+  const challenge = await page.goto(protectedPath, { referer: originalReferer });
   expect(challenge.status()).toBe(401);
   expect(challenge.headers()['cache-control']).toBe('no-store');
   expect(challenge.headers()['content-security-policy']).toBeTruthy();
@@ -25,6 +27,9 @@ test('solving the hosted challenge authorizes the original URL and subsequent re
   expect(completion.status()).toBe(204);
   expect(completion.headers()['cache-control']).toBe('no-store');
   expect(application.status()).toBe(200);
+  expect(application.headers()['x-demo-uri']).toBe(protectedURL.pathname + protectedURL.search);
+  expect(await application.request().headerValue('referer')).toBeNull();
+  expect(application.headers()['x-demo-referer']).toBe(originalReferer);
   await expect(page).toHaveURL(protectedURL.href);
   await expect(page.locator('body')).toHaveText(applicationText);
 
@@ -44,19 +49,23 @@ test('solving the hosted challenge authorizes the original URL and subsequent re
 
   const reload = await page.reload();
   expect(reload.status()).toBe(200);
+  expect(reload.headers()['x-demo-referer']).not.toBe(originalReferer);
   await expect(page).toHaveURL(protectedURL.href);
   await expect(page.locator('body')).toHaveText(applicationText);
 
+  const authorizedPath = protectedURL.pathname + protectedURL.search;
+  const referer = new URL('/referring-page?source=original', baseURL).href;
   for (const method of ['GET', 'POST']) {
-    const response = await context.request.fetch('/private?demo=playwright-authorized', {
+    const response = await context.request.fetch(authorizedPath, {
       method,
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', Referer: referer },
       data: method === 'POST' ? 'marker=playwright' : undefined,
     });
     expect(response.status()).toBe(200);
     expect(response.headers()['x-demo-method']).toBe(method);
-    expect(response.headers()['x-demo-uri']).toBe('/private?demo=playwright-authorized');
+    expect(response.headers()['x-demo-uri']).toBe(authorizedPath);
     expect(response.headers()['x-demo-host']).toBe(protectedURL.host);
+    expect(response.headers()['x-demo-referer']).toBe(referer);
     expect(await response.text()).toBe(applicationText);
   }
 
