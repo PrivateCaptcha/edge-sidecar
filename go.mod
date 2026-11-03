@@ -8,7 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jpillora/backoff v1.0.0
 	github.com/justinas/alice v1.2.0
-	github.com/maypok86/otter/v2 v2.3.0
+	github.com/maypok86/otter/v2 v2.4.0
 	github.com/realclientip/realclientip-go v1.0.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.61.0
@@ -51,7 +51,7 @@ require (
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/slok/go-http-metrics v0.13.0 // indirect
 	github.com/speps/go-hashids/v2 v2.0.1 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
