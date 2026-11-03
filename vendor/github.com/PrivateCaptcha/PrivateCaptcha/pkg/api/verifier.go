@@ -308,7 +308,13 @@ func (v *Verifier) verify(
 			}
 		} else {
 			slog.ErrorContext(ctx, "Failed to fetch valid owner ID", "puzzleID", puzzleObject.PuzzleID(), common.ErrAttr(err))
-			return nil, property, errPuzzleOwner
+			// Only genuine auth failures collapse to errPuzzleOwner (-> 403). Infrastructure
+			// errors propagate as-is so the verify handlers' default branch returns 5xx,
+			// matching how the AuthMiddleware classifies the same lookup.
+			if errors.Is(err, errInvalidAPIKey) || errors.Is(err, errAPIKeyScope) || errors.Is(err, errAPIKeyNotSet) {
+				return nil, property, errPuzzleOwner
+			}
+			return nil, property, err
 		}
 	}
 
@@ -341,6 +347,9 @@ func (v *Verifier) verify(
 		result.SetError(verr)
 		return result, property, nil
 	}
+
+	result.EdgeTokenValidity = puzzleObject.EdgeTokenValidity()
+	result.PuzzleVersion = puzzleObject.Version()
 
 	return result, property, nil
 }
@@ -496,7 +505,14 @@ func (v *Verifier) PuzzleForRequest(r *http.Request, levels *difficulty.Levels, 
 
 	verificationRate := v.PropertyStats.VerificationRate(property.ID, tnow)
 	puzzleDifficulty, _, err := levels.DifficultyEx(ctx, fingerprint, difficultyProperty, tnow, verificationRate)
-	challenge, wireDifficulty, fallback, challengeErr := selectPropertyChallenge(property.Challenge, puzzleDifficulty, r.Header.Get(common.HeaderCaptchaVersion), v.argon2IDEnabled())
+	// The captcha-version header is the same legacy/v3-capability signal used by
+	// selectPropertyChallenge: "1" is the standard-widget signal and "2" is the
+	// extended/Argon2id-capable signal (both predate the v3 parser, see
+	// PuzzleForRequest docs and the widget's x-pc-captcha-version advertisement in
+	// widget/js/puzzle.js). Neither "1" nor "2" is treated as a precise v3 indicator;
+	// only values other than "1"/"2" (or an omitted header) opt into the v3 wire bump.
+	captchaVersion := r.Header.Get(common.HeaderCaptchaVersion)
+	challenge, wireDifficulty, fallback, challengeErr := selectPropertyChallenge(property.Challenge, puzzleDifficulty, captchaVersion, v.argon2IDEnabled())
 	if challengeErr != nil {
 		slog.ErrorContext(ctx, "Invalid property challenge", "propID", property.ID, "challenge", property.Challenge, common.ErrAttr(challengeErr))
 		return nil, property, challengeErr
@@ -509,6 +525,18 @@ func (v *Verifier) PuzzleForRequest(r *http.Request, levels *difficulty.Levels, 
 	}
 	if err := result.Init(property.ValidityInterval); err != nil {
 		slog.ErrorContext(ctx, "Failed to init puzzle", common.ErrAttr(err))
+	}
+	// Only attach edge-token validity to the payload when the client advertises a
+	// captcha version that can parse the v3 wire format. SetEdgeTokenValidity
+	// upgrades the wire format to version 3, which pre-v3 widget bundles cannot
+	// parse. "1" is the legacy/standard-widget signal and "2" is the
+	// extended/Argon2id-capable signal (commit 4190876d, v1.45.0 / npm core-lib
+	// 0.0.28-0.0.31); both predate the v3 parser (commit d053eb51, npm 0.0.32), so
+	// released "2"-senders cannot parse v3. Legacy (< v3) clients still receive
+	// edge tokens: addEdgeToken falls back to property.EdgeTokenValidityInterval
+	// when the puzzle's wire version did not carry the validity field.
+	if property.EdgeTokenValidityInterval > 0 && captchaVersion != "1" && captchaVersion != "2" {
+		result.SetEdgeTokenValidity(difficultyProperty.EdgeTokenValidity())
 	}
 
 	accessRecord := v.createPuzzleAccess(difficultyProperty, fingerprint, result, tnow, ri)
