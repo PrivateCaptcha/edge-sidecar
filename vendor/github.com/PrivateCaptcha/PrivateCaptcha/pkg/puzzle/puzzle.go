@@ -26,6 +26,8 @@ const (
 	MaxValidityPeriod     = 24 * time.Hour
 	puzzleVersion1        = 1
 	puzzleVersion2        = 2
+	puzzleVersion3        = 3              // Adds edge-token validity seconds after expiration.
+	PuzzleVersion3        = puzzleVersion3 // Exported for cross-package wire-format comparisons (e.g. edge-token-validity presence).
 	puzzleFieldsSize      = PropertyIDSize + 8 + 1 + 1 + 4
 	puzzleV2MinSize       = 1 + 1 + puzzleFieldsSize + UserDataSize
 	maxPuzzleBodySize     = 2 * PuzzleBytesLength
@@ -50,14 +52,15 @@ func (c Challenge) valid() bool {
 }
 
 type ComputePuzzle struct {
-	version        uint8
-	challenge      Challenge
-	difficulty     uint8
-	solutionsCount uint8
-	propertyID     [PropertyIDSize]byte
-	puzzleID       uint64
-	expiration     time.Time
-	userData       []byte
+	version           uint8
+	challenge         Challenge
+	difficulty        uint8
+	solutionsCount    uint8
+	propertyID        [PropertyIDSize]byte
+	puzzleID          uint64
+	expiration        time.Time
+	edgeTokenValidity uint32
+	userData          []byte
 }
 
 var _ Puzzle = (*ComputePuzzle)(nil)
@@ -122,6 +125,19 @@ func (p *ComputePuzzle) SolutionsCount() int              { return int(p.solutio
 func (p *ComputePuzzle) Expiration() time.Time            { return p.expiration }
 func (p *ComputePuzzle) PropertyID() [PropertyIDSize]byte { return p.propertyID }
 
+func (p *ComputePuzzle) EdgeTokenValidity() time.Duration {
+	return time.Duration(p.edgeTokenValidity) * time.Second
+}
+
+func (p *ComputePuzzle) Version() uint8 {
+	return p.version
+}
+
+func (p *ComputePuzzle) SetEdgeTokenValidity(validity time.Duration) {
+	p.version = puzzleVersion3
+	p.edgeTokenValidity = uint32(validity / time.Second)
+}
+
 func (p *ComputePuzzle) HashKey() uint64 {
 	hasher := fnv.New64a()
 
@@ -154,7 +170,7 @@ func (p *ComputePuzzle) IsZero() bool {
 
 func (p *ComputePuzzle) WriteTo(w io.Writer) (int64, error) {
 	var n int64
-	if p.version != puzzleVersion1 && p.version != puzzleVersion2 {
+	if p.version != puzzleVersion1 && p.version != puzzleVersion2 && p.version != puzzleVersion3 {
 		return n, errInvalidPuzzleVersion
 	}
 	if !p.challenge.valid() || (p.version == puzzleVersion1 && p.challenge != ChallengeBlake2b) {
@@ -165,7 +181,7 @@ func (p *ComputePuzzle) WriteTo(w io.Writer) (int64, error) {
 		return n, err
 	}
 	n++
-	if p.version == puzzleVersion2 {
+	if p.version >= puzzleVersion2 {
 		if err := binary.Write(w, binary.LittleEndian, p.challenge); err != nil {
 			return n, err
 		}
@@ -201,6 +217,13 @@ func (p *ComputePuzzle) WriteTo(w io.Writer) (int64, error) {
 	}
 	n += 4
 
+	if p.version >= puzzleVersion3 {
+		if err := binary.Write(w, binary.LittleEndian, p.edgeTokenValidity); err != nil {
+			return n, err
+		}
+		n += 4
+	}
+
 	if nn, err := w.Write(p.userData); err != nil {
 		return n + int64(nn), err
 	}
@@ -226,14 +249,14 @@ func (p *ComputePuzzle) UnmarshalBinary(data []byte) error {
 	}
 
 	version := data[0]
-	if version != puzzleVersion1 && version != puzzleVersion2 {
+	if version != puzzleVersion1 && version != puzzleVersion2 && version != puzzleVersion3 {
 		return errInvalidPuzzleVersion
 	}
 
 	p.version = version
 	p.challenge = ChallengeBlake2b
 	offset := 1
-	if version == puzzleVersion2 {
+	if version >= puzzleVersion2 {
 		if len(data) < offset+1 {
 			return io.ErrShortBuffer
 		}
@@ -243,7 +266,11 @@ func (p *ComputePuzzle) UnmarshalBinary(data []byte) error {
 		}
 		offset++
 	}
-	if len(data) < offset+puzzleFieldsSize+UserDataSize {
+	minimumSize := offset + puzzleFieldsSize + UserDataSize
+	if version >= puzzleVersion3 {
+		minimumSize += 4
+	}
+	if len(data) < minimumSize {
 		return io.ErrShortBuffer
 	}
 
@@ -265,6 +292,12 @@ func (p *ComputePuzzle) UnmarshalBinary(data []byte) error {
 		p.expiration = time.Unix(unixExpiration, 0).UTC()
 	}
 	offset += 4
+
+	p.edgeTokenValidity = 0
+	if version >= puzzleVersion3 {
+		p.edgeTokenValidity = binary.LittleEndian.Uint32(data[offset : offset+4])
+		offset += 4
+	}
 
 	p.userData = data[offset:]
 

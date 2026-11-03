@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
@@ -29,20 +30,17 @@ func NewAuditLog(querier dbgen.Querier, batchSize int) *AuditLog {
 	}
 }
 
-func (al *AuditLog) Start(ctx context.Context, interval time.Duration) {
+func (al *AuditLog) Start(ctx context.Context, interval time.Duration, workers *sync.WaitGroup) {
 	var cancelCtx context.Context
 	cancelCtx, al.persistCancel = context.WithCancel(
 		context.WithValue(ctx, common.TraceIDContextKey, "persist_auditlog"))
-	go common.ProcessBatchArray(cancelCtx, al.persistChan, interval, al.batchSize, al.batchSize*10, al.PersistAuditLog)
+	workers.Go(func() {
+		common.ProcessBatchArray(cancelCtx, al.persistChan, interval, al.batchSize, al.batchSize*10, al.PersistAuditLog)
+	})
 }
 
 func (al *AuditLog) Stop() {
 	al.persistCancel()
-}
-
-func (al *AuditLog) Shutdown() {
-	slog.Debug("Shutting down audit log persistence")
-	close(al.persistChan)
 }
 
 func (al *AuditLog) PersistAuditLog(ctx context.Context, batch []*common.AuditLogEvent) error {
