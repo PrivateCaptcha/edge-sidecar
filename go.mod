@@ -6,7 +6,7 @@ require (
 	github.com/PrivateCaptcha/PrivateCaptcha v1.45.1-0.20261010202224-18634f50b7dd
 	github.com/PrivateCaptcha/private-captcha-go v0.0.14-0.20261010155502-a3a306d587c6
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/jpillora/backoff v1.0.0
+	github.com/jpillora/backoff v1.1.0
 	github.com/justinas/alice v1.2.0
 	github.com/maypok86/otter/v2 v2.3.0
 	github.com/realclientip/realclientip-go v1.0.0
