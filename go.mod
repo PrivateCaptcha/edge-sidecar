@@ -11,7 +11,7 @@ require (
 	github.com/maypok86/otter/v2 v2.4.0
 	github.com/realclientip/realclientip-go v1.0.0
 	golang.org/x/crypto v0.58.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 )
 
 require (
