@@ -399,3 +399,97 @@ func TestEdgeSidecarGateExpiredFailure(t *testing.T) {
 		t.Fatal("gate failure affected cached token authorization or was not throttled")
 	}
 }
+
+func TestEdgeSidecarLongQueryStringAuth(t *testing.T) {
+	f := newEdgeFixture(t)
+	body, csp := hostedGate(t, f.s.sitekey)
+	var gateCalls atomic.Int32
+	f.useAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gateCalls.Add(1)
+		w.Header().Set(common.HeaderContentType, common.ContentTypeHTML)
+		w.Header().Set(common.HeaderContentSecurityPolicy, csp)
+		w.Header().Set(common.HeaderCacheControl, "public, max-age=300")
+		w.Write(body)
+	}))
+	token := f.token(t, nil, nil)
+	// A query that pushes r.RequestURI past maxRequestURI, simulating Caddy
+	// forward_auth preserving the original query on the auth subrequest
+	// (uri /auth without a trailing ? to clear the query string).
+	longQuery := strings.Repeat("q", maxRequestURI)
+	withLongQuery := func(r *http.Request) *http.Request {
+		r.URL.RawQuery = longQuery
+		r.RequestURI = r.URL.Path + "?" + longQuery
+		if len(r.RequestURI) <= maxRequestURI {
+			t.Fatalf("request URI not long enough: %d", len(r.RequestURI))
+		}
+		return r
+	}
+
+	// The length check must evaluate the auth path, not the echoed query string.
+	// Validate should reach the cookie check and return "missing", not
+	// "malformed_request".
+	if reason := f.a.validate(withLongQuery(authRequest(""))); reason != reasonMissing {
+		t.Fatalf("long-query no-cookie validate: got %q want %q", reason, reasonMissing)
+	}
+
+	// Unauthenticated browser navigation with a long query should receive the
+	// hosted captcha challenge, not a bare empty 401.
+	w := httptest.NewRecorder()
+	f.a.auth(w, withLongQuery(navigationRequest("")))
+	if w.Code != 401 || !bytes.Contains(w.Body.Bytes(), []byte(`id="gate-form"`)) {
+		t.Fatalf("long-query navigation should get hosted challenge: status=%d body=%d bytes", w.Code, w.Body.Len())
+	}
+	if gateCalls.Load() != 1 {
+		t.Fatal("long-query navigation did not fetch the gate")
+	}
+
+	// A valid edge cookie with a long query should authorize the request (204);
+	// the length check no longer fires before the cookie is evaluated.
+	w = httptest.NewRecorder()
+	f.a.auth(w, withLongQuery(authRequest(token)))
+	if w.Code != 204 {
+		t.Fatalf("long-query with valid cookie should authorize: status=%d body=%q", w.Code, w.Body.String())
+	}
+	if gateCalls.Load() != 1 {
+		t.Fatal("authorized request should not fetch the gate")
+	}
+
+	// Non-navigation with a long query and no cookie should get a bare 401
+	// (no challenge), but the reason is "missing" rather than "malformed_request".
+	w = httptest.NewRecorder()
+	r := withLongQuery(authRequest(""))
+	r.Header.Set(HeaderSecFetchMode, "cors")
+	f.a.auth(w, r)
+	if w.Code != 401 || w.Body.Len() != 0 {
+		t.Fatalf("non-navigation long-query should get bare 401: status=%d body=%d bytes", w.Code, w.Body.Len())
+	}
+
+	// A body on the auth subrequest still triggers malformed_request; the
+	// challenge is not served even for browser navigation.
+	w = httptest.NewRecorder()
+	r = navigationRequest("")
+	r.ContentLength = 1
+	f.a.auth(w, r)
+	if w.Code != 401 || w.Body.Len() != 0 {
+		t.Fatalf("bodied request should get bare 401: status=%d body=%d bytes", w.Code, w.Body.Len())
+	}
+	if gateCalls.Load() != 1 {
+		t.Fatal("bodied request should not fetch the gate")
+	}
+
+	// The path-length limit still applies to the path itself: a path exceeding
+	// maxRequestURI triggers malformed_request; a path of exactly maxRequestURI
+	// does not.
+	pathRequest := func(path string) *http.Request {
+		pr := authRequest("")
+		pr.URL.Path = path
+		pr.RequestURI = path
+		return pr
+	}
+	if reason := f.a.validate(pathRequest("/" + strings.Repeat("a", maxRequestURI))); reason != reasonMalformedRequest {
+		t.Fatalf("oversized path should trigger malformed_request: got %q", reason)
+	}
+	if reason := f.a.validate(pathRequest("/" + strings.Repeat("a", maxRequestURI-1))); reason == reasonMalformedRequest {
+		t.Fatal("path of exactly maxRequestURI should not be rejected")
+	}
+}
