@@ -30,7 +30,7 @@ github.com/PrivateCaptcha/PrivateCaptcha/pkg/puzzle
 github.com/PrivateCaptcha/PrivateCaptcha/pkg/ratelimit
 github.com/PrivateCaptcha/PrivateCaptcha/pkg/rules
 github.com/PrivateCaptcha/PrivateCaptcha/pkg/session
-# github.com/PrivateCaptcha/private-captcha-go v0.0.14-0.20261010155502-a3a306d587c6
+# github.com/PrivateCaptcha/private-captcha-go v0.0.14
 ## explicit; go 1.24.2
 github.com/PrivateCaptcha/private-captcha-go
 # github.com/andybalholm/brotli v1.2.2

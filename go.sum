@@ -12,6 +12,8 @@ github.com/PrivateCaptcha/PrivateCaptcha v1.45.1-0.20261010202224-18634f50b7dd h
 github.com/PrivateCaptcha/PrivateCaptcha v1.45.1-0.20261010202224-18634f50b7dd/go.mod h1:QefHOwSj3C2VbRVMBvcb1wAU0iwKid4bb4Kw3ZPa25k=
 github.com/PrivateCaptcha/private-captcha-go v0.0.14-0.20261010155502-a3a306d587c6 h1:QtmIvRBCsdnUfUhqVPY+sSWf7iLY5Ew7xEcPHWoA4mc=
 github.com/PrivateCaptcha/private-captcha-go v0.0.14-0.20261010155502-a3a306d587c6/go.mod h1:SGJM9EUaDeIZ4D3OGzoppznPf4W1dfskuZiYAkenlbQ=
+github.com/PrivateCaptcha/private-captcha-go v0.0.14 h1:mqv9XkJweME/DZHBcPngh64Wqi/g3+fBNx9/iX87BKE=
+github.com/PrivateCaptcha/private-captcha-go v0.0.14/go.mod h1:SGJM9EUaDeIZ4D3OGzoppznPf4W1dfskuZiYAkenlbQ=
 github.com/PuerkitoBio/goquery v1.13.0 h1:mqHbjD7Jmnul4DTR24LKTjo1uUmHUh072kteGV+xpFM=
 github.com/PuerkitoBio/goquery v1.13.0/go.mod h1:Hip5mdBL8K2wEGKJdr27sRaNwIdDajmCwB/ExUPwW+g=
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=
