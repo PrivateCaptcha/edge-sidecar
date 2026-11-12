@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/PrivateCaptcha/PrivateCaptcha/pkg/common"
@@ -93,8 +94,9 @@ type Server struct {
 	VerifyLogCancel      context.CancelFunc
 	FormSubmitLogChan    chan *common.FormSubmitRecord
 	FormSubmitLogCancel  context.CancelFunc
-	FormSubmissionChan   chan *FormSubmission
 	FormSubmitCancel     context.CancelFunc
+	formSubmissionChan   chan *FormSubmission
+	formQueue            *formQueueState
 	formInlineBypassSlot chan struct{}
 	FailingForms         *common.ExpiringCounterMap[int32]
 	APICors              *cors.Cors
@@ -194,10 +196,11 @@ type ServerConfig struct {
 	VerifyFlushInterval time.Duration
 	AuthBackfillDelay   time.Duration
 	FormFlushInterval   time.Duration
+	FormQueueCapacity   int
 	BackpressureTimeout time.Duration
 }
 
-func (s *Server) Init(ctx context.Context, config ServerConfig) error {
+func (s *Server) Init(ctx context.Context, config ServerConfig, workers *sync.WaitGroup) error {
 	if s.FeatureFlags == nil {
 		s.FeatureFlags = common.EnabledFeatureFlags{}
 	}
@@ -208,16 +211,22 @@ func (s *Server) Init(ctx context.Context, config ServerConfig) error {
 		slog.ErrorContext(ctx, "Failed to update puzzle verifier", common.ErrAttr(err))
 		return err
 	}
+	if s.formSubmissionChan == nil {
+		s.formSubmissionChan = make(chan *FormSubmission, config.FormQueueCapacity)
+	}
+	s.formQueue = &formQueueState{}
 
-	s.Levels.Init(2*time.Second /*access log interval*/, PropertyBucketSize /*backfill interval*/, config.BackpressureTimeout)
-	s.Auth.StartBackfill(config.AuthBackfillDelay, config.BackpressureTimeout)
+	s.Levels.Init(2*time.Second /*access log interval*/, PropertyBucketSize /*backfill interval*/, config.BackpressureTimeout, workers)
+	s.Auth.StartBackfill(config.AuthBackfillDelay, config.BackpressureTimeout, workers)
 	s.RegisterTaskHandlers(ctx)
 
 	baseVerifyCtx := context.WithValue(context.Background(), common.ServiceContextKey, ApiService)
 	var cancelVerifyCtx context.Context
 	cancelVerifyCtx, s.VerifyLogCancel = context.WithCancel(context.WithValue(baseVerifyCtx, common.TraceIDContextKey, "flush_verify_log"))
 
-	go common.ProcessBatchArray(cancelVerifyCtx, s.VerifyLogChan, config.VerifyFlushInterval, VerifyBatchSize, maxVerifyBatchSize, s.TimeSeries.WriteVerifyLogBatch)
+	workers.Go(func() {
+		common.ProcessBatchArray(cancelVerifyCtx, s.VerifyLogChan, config.VerifyFlushInterval, VerifyBatchSize, maxVerifyBatchSize, s.TimeSeries.WriteVerifyLogBatch)
+	})
 
 	if s.FailingForms == nil {
 		s.FailingForms = common.NewExpiringCounterMap[int32]()
@@ -231,12 +240,19 @@ func (s *Server) Init(ctx context.Context, config ServerConfig) error {
 	baseFormSubmitLogCtx := context.WithValue(context.Background(), common.ServiceContextKey, ApiService)
 	var cancelFormSubmitLogCtx context.Context
 	cancelFormSubmitLogCtx, s.FormSubmitLogCancel = context.WithCancel(context.WithValue(baseFormSubmitLogCtx, common.TraceIDContextKey, "flush_form_submit_log"))
-	go common.ProcessBatchArray(cancelFormSubmitLogCtx, s.FormSubmitLogChan, config.FormFlushInterval, FormSubmitLogBatchSize, maxFormSubmitLogBatchSize, s.TimeSeries.WriteFormSubmitBatch)
+	workers.Go(func() {
+		common.ProcessBatchArray(cancelFormSubmitLogCtx, s.FormSubmitLogChan, config.FormFlushInterval, FormSubmitLogBatchSize, maxFormSubmitLogBatchSize, s.TimeSeries.WriteFormSubmitBatch)
+	})
 
 	baseFormCtx := context.WithValue(context.Background(), common.ServiceContextKey, ApiService)
 	var cancelFormCtx context.Context
 	cancelFormCtx, s.FormSubmitCancel = context.WithCancel(context.WithValue(baseFormCtx, common.TraceIDContextKey, "submit_forms"))
-	go common.ProcessBatchArray(cancelFormCtx, s.FormSubmissionChan, config.FormFlushInterval, FormBatchSize, maxFormBatchSize, s.submitFormBatch)
+	workers.Go(func() {
+		// Recording consumers stay available until the queued forms finish.
+		defer s.stopRecording()
+		defer s.FormSubmitCancel()
+		common.ProcessBatchArray(cancelFormCtx, s.formSubmissionChan, config.FormFlushInterval, FormBatchSize, maxFormBatchSize, s.submitFormBatch)
+	})
 
 	return nil
 }
@@ -293,24 +309,25 @@ func (s *Server) Setup(domain string, verbose bool, security alice.Constructor) 
 }
 
 func (s *Server) Stop() {
-	s.Levels.Stop()
 	s.Auth.Stop()
-
-	s.VerifyLogCancel()
-	// cancel producer before consumer
-	s.FormSubmitCancel()
-	s.FormSubmitLogCancel()
+	s.Levels.StopBackfill()
+	if s.formQueue != nil {
+		s.formQueue.mu.Lock()
+		if !s.formQueue.stopped {
+			s.formQueue.stopped = true
+			close(s.formSubmissionChan)
+		}
+		s.formQueue.mu.Unlock()
+		return
+	}
+	s.stopRecording()
 }
 
-func (s *Server) Shutdown() {
-	s.Levels.Shutdown()
-	s.Auth.Shutdown()
+func (s *Server) stopRecording() {
+	s.Levels.StopAccessLog()
 
-	slog.Debug("Shutting down API server routines")
-	// background goroutines can call addFormSubmitRecord()/addVerifyRecord()  so we don't close channels here
-	// close(s.VerifyLogChan)
-	// close(s.FormSubmitLogChan)
-	// close(s.FormSubmissionChan)
+	s.VerifyLogCancel()
+	s.FormSubmitLogCancel()
 }
 
 func (s *Server) setupWithPrefix(rg *common.RouteGenerator, apiCorsHandler, formCorsHandler, security alice.Constructor) {
@@ -350,6 +367,9 @@ func (s *Server) setupWithPrefix(rg *common.RouteGenerator, apiCorsHandler, form
 	formChain := publicChain.Append(formCorsHandler, s.Metrics.APIHandlerIDFunc(rg.LastPath), formRateLimiter, monitoring.Traced, common.SoftTimeoutHandler(5*time.Second), s.Auth.Form)
 	rg.Handle(rg.Post(common.FormEndpoint, arg(common.ParamForm)), formChain, http.MaxBytesHandler(http.HandlerFunc(s.formProxyHandler), maxFormBodySize))
 	rg.Handle(rg.Options(common.FormEndpoint, arg(common.ParamForm)), publicChain.Append(s.Metrics.APIHandler, common.Cached, formCorsHandler), http.HandlerFunc(s.formPreFlight))
+
+	rg.Handle(rg.Get(common.WellKnownEndpoint, common.JWKSFileEndpoint), publicChain.Append(s.Metrics.APIHandler, s.RateLimiter.RateLimit), http.HandlerFunc(s.edgeJWKSHandler))
+	rg.Handle(rg.Get(common.GateEndpoint, common.PageEndpoint), publicChain.Append(s.Metrics.APIHandler, s.RateLimiter.RateLimit, s.Auth.GateSitekey), http.HandlerFunc(s.gatePageHandler))
 
 	s.setupEnterprise(rg, publicChain, apiRateLimiter)
 
@@ -581,12 +601,12 @@ func (s *Server) applyAPIKeyRateLimits(ctx context.Context, r *http.Request, api
 	if apiKey == nil {
 		return
 	}
-	if apiKey.RequestsPerSecond > 0 && !math.IsInf(apiKey.RequestsPerSecond, 0) {
+	if apiKey.RequestsPerSecond > 0 && !math.IsInf(apiKey.RequestsPerSecond, 0) && apiKey.RequestsBurst > 0 {
 		interval := float64(time.Second) / apiKey.RequestsPerSecond
 		s.RateLimiter.UpdateRequestLimits(r, uint32(apiKey.RequestsBurst), time.Duration(interval))
 	} else {
-		slog.WarnContext(ctx, "Skipping per-key rate limit update due to invalid RequestsPerSecond",
-			"requestsPerSecond", apiKey.RequestsPerSecond)
+		slog.WarnContext(ctx, "Skipping per-key rate limit update due to invalid RequestsPerSecond/RequestsBurst",
+			"requestsPerSecond", apiKey.RequestsPerSecond, "requestsBurst", apiKey.RequestsBurst)
 	}
 }
 
@@ -609,15 +629,19 @@ func (s *Server) addEdgeToken(r *http.Request, response *VerificationResponse, r
 		return nil
 	}
 	ctx := r.Context()
-	validity := property.EdgeTokenValidityInterval
-	if rulesPair := s.retrievePropertyRules(ctx, property); rulesPair != nil && (rulesPair.PropertyRules != nil || rulesPair.OrgRules != nil) {
-		countryCodeHeader := ""
-		if s.CountryCodeHeader != nil {
-			countryCodeHeader = s.CountryCodeHeader.Value()
+	validity := result.EdgeTokenValidity
+	// Stub puzzles (cold cache) and puzzles issued to legacy (< v3) clients never
+	// carry the edge-token-validity field in the wire payload, so the server-side
+	// value is zero. Recompute it from the property so those users still receive an
+	// edge token (mirroring the stub-puzzle path). v3 payloads carry validity
+	// authoritatively, so a zero there means a rule explicitly disabled the token.
+	if result.PuzzleID == 0 || (result.PuzzleVersion < puzzle.PuzzleVersion3) {
+		if rulesPair := s.retrievePropertyRules(ctx, property); rulesPair.HasBlockRules() {
+			slog.Log(ctx, common.LevelTrace, "Issuing short-lived edge token for stub/legacy puzzle")
+			validity = puzzle.ValidityDurations[0]
+		} else {
+			validity = property.EdgeTokenValidityInterval
 		}
-		ri := rules.NewRequestInfo(r, countryCodeHeader)
-		propertyForRequest := rulesPair.Apply(ri, difficulty.NewDBProperty(property))
-		validity = propertyForRequest.EdgeTokenValidity()
 	}
 	if validity == 0 {
 		return nil

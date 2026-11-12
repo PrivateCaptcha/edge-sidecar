@@ -32,9 +32,6 @@ func (s *Server) setupEnterprise(rg *common.RouteGenerator, publicChain alice.Ch
 		return fmt.Sprintf("{%s}", s)
 	}
 
-	rg.Handle(rg.Get(common.WellKnownEndpoint, common.JWKSFileEndpoint), publicChain.Append(s.Metrics.APIHandler, s.RateLimiter.RateLimit), http.HandlerFunc(s.edgeJWKSHandler))
-	rg.Handle(rg.Get(common.GateEndpoint, common.PageEndpoint), publicChain.Append(s.Metrics.APIHandler, s.RateLimiter.RateLimit, s.Auth.GateSitekey), http.HandlerFunc(s.gatePageHandler))
-
 	// "portal" API
 	portalAPIChain := publicChain.Append(
 		s.Metrics.APIHandlerIDFunc(rg.LastPath),
@@ -75,7 +72,7 @@ func (s *Server) requestUser(ctx context.Context, readOnly bool) (*dbgen.User, *
 }
 
 func (s *Server) requestUserEx(ctx context.Context, readOnly bool, requiresSubscription bool) (*dbgen.User, *dbgen.APIKey, error) {
-	portalOwnerSource := &apiKeyOwnerSource{Store: s.BusinessDB, scope: dbgen.ApiKeyScopePortal}
+	portalOwnerSource := &apiKeyOwnerSource{Store: s.BusinessDB, Auth: s.Auth, scope: dbgen.ApiKeyScopePortal}
 	id, _, err := portalOwnerSource.OwnerID(ctx, time.Now().UTC())
 	if err != nil {
 		return nil, nil, err
