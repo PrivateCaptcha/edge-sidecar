@@ -52,8 +52,8 @@ require (
 	github.com/slok/go-http-metrics v0.13.0 // indirect
 	github.com/speps/go-hashids/v2 v2.0.1 // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
-	go.opentelemetry.io/otel v1.44.0 // indirect
-	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
