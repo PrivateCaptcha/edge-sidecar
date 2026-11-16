@@ -1,9 +1,9 @@
 module github.com/PrivateCaptcha/edge-sidecar
 
-go 1.27.2
+go 1.27.3
 
 require (
-	github.com/PrivateCaptcha/PrivateCaptcha v1.45.1-0.20261010202224-18634f50b7dd
+	github.com/PrivateCaptcha/PrivateCaptcha v1.46.1
 	github.com/PrivateCaptcha/private-captcha-go v0.0.14
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jpillora/backoff v1.1.0
