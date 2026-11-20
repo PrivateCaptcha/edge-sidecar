@@ -43,7 +43,7 @@ services:
       - app
 
   app:
-    image: caddy:2.11.7-alpine
+    image: caddy:2.11.8-alpine
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     volumes:
       - ./Caddyfile.app:/etc/caddy/Caddyfile:ro

@@ -23,7 +23,7 @@ services:
     stop_grace_period: 15s
 
   caddy:
-    image: caddy:2.11.7-alpine
+    image: caddy:2.11.8-alpine
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     environment:
       PC_PROTECTED_SITE: https://${PC_EDGE_HOST:-edge.privatecaptcha.test}:${PC_EDGE_PORT:-8443}
@@ -42,7 +42,7 @@ services:
       - app
 
   app:
-    image: caddy:2.11.7-alpine
+    image: caddy:2.11.8-alpine
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     volumes:
       - ./Caddyfile.app:/etc/caddy/Caddyfile:ro
