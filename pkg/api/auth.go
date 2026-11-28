@@ -175,9 +175,9 @@ func (a *Authorizer) auth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Authorizer) validate(r *http.Request) denialReason {
-	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(r.RequestURI) > maxRequestURI {
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 || len(r.URL.Path) > maxRequestURI {
 		slog.WarnContext(r.Context(), "Malformed authorization request", "endpoint", authPath,
-			"content_length", r.ContentLength, "transfer_encodings", len(r.TransferEncoding), "uri_length", len(r.RequestURI))
+			"content_length", r.ContentLength, "transfer_encodings", len(r.TransferEncoding), "path_length", len(r.URL.Path))
 		return reasonMalformedRequest
 	}
 	host, err := a.s.requestHost(r)
